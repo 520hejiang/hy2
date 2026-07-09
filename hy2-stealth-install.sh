@@ -3,49 +3,59 @@
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
+BLUE="\033[34m"
 PLAIN="\033[0m"
 
 red()    { echo -e "${RED}$1${PLAIN}"; }
 green()  { echo -e "${GREEN}$1${PLAIN}"; }
 yellow() { echo -e "${YELLOW}$1${PLAIN}"; }
+blue()   { echo -e "${BLUE}$1${PLAIN}"; }
 
-[[ $EUID -ne 0 ]] && red "请使用 root 运行" && exit 1
+[[ $EUID -ne 0 ]] && red "请使用 root 权限运行！" && exit 1
 
-# ────────────────────────────────────────────
-# 获取公网 IP
-# ────────────────────────────────────────────
+CONFIG_DIR="/etc/hysteria"
+CLIENT_DIR="/root/hy2"
+SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
+INFO_FILE="/root/hy2/install.info"
+
+# ==================== 基础函数 ====================
+
 get_ip() {
-  IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null)
-  [[ -z "$IP" ]] && IP=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null)
-  [[ -z "$IP" ]] && red "无法获取公网 IP，请检查网络" && exit 1
-  yellow "服务器 IP: $IP"
+    IP=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null || curl -s --max-time 8 https://ifconfig.me 2>/dev/null)
+    [[ -z "$IP" ]] && { red "无法获取公网 IP，请检查网络"; exit 1; }
+    yellow "当前服务器 IP: $IP"
 }
 
-# ────────────────────────────────────────────
-# 安装 Hysteria2
-# ────────────────────────────────────────────
-install_hysteria() {
-  yellow "安装 Hysteria2..."
-  bash <(curl -fsSL https://get.hy2.sh) || { red "安装失败"; exit 1; }
-  green "安装成功"
+check_installed() {
+    if systemctl is-active --quiet hysteria-server 2>/dev/null || [[ -f "$CONFIG_DIR/config.yaml" ]]; then
+        green "检测到 Hysteria2 已安装"
+        return 0
+    fi
+    return 1
 }
 
-# ────────────────────────────────────────────
-# 随机可用端口
-# ────────────────────────────────────────────
-set_port() {
-  PORT=443
-  yellow "监听端口: $PORT"
+check_dependencies() {
+    for cmd in curl openssl systemctl iptables qrencode; do
+        if ! command -v $cmd >/dev/null 2>&1; then
+            yellow "安装缺失依赖: $cmd"
+            apt update -qq && apt install -y $cmd || yum install -y $cmd || true
+        fi
+    done
 }
 
-# ────────────────────────────────────────────
-# 模式A：域名 + ACME 自动证书
-# ────────────────────────────────────────────
+install_hysteria_bin() {
+    yellow "安装/更新 Hysteria2 官方二进制..."
+    bash <(curl -fsSL https://get.hy2.sh) || { red "安装失败"; exit 1; }
+    green "Hysteria2 安装成功"
+}
+
+# ==================== 配置生成 ====================
+
 gen_config_acme() {
-  PASS=$(openssl rand -base64 16 | tr -d "=+/")
-  mkdir -p /etc/hysteria
+    PASS=$(openssl rand -base64 32 | tr -d "=+/")
+    mkdir -p "$CONFIG_DIR" "$CLIENT_DIR"
 
-  cat > /etc/hysteria/config.yaml <<EOF
+    cat > "$CONFIG_DIR/config.yaml" <<EOF
 listen: :$PORT
 
 acme:
@@ -60,21 +70,18 @@ auth:
 masquerade:
   type: proxy
   proxy:
-    url: https://bing.com
+    url: https://www.microsoft.com
     rewriteHost: true
 
 quic:
-  initStreamReceiveWindow: 16777216
+  initStreamReceiveWindow: 8388608
   maxStreamReceiveWindow: 16777216
   initConnReceiveWindow: 33554432
-  maxConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 67108864
 EOF
 
-  mkdir -p /root/hy2
-  # ACME 证书是正规证书，不需要 insecure 也不需要指纹
-  echo "hysteria2://$PASS@$DOMAIN:$PORT/?sni=$DOMAIN#HY2-$DOMAIN" > /root/hy2/link.txt
-
-  cat > /root/hy2/client.yaml <<EOF
+    echo "hysteria2://$PASS@$DOMAIN:$PORT/?sni=$DOMAIN#HY2-$DOMAIN" > "$CLIENT_DIR/link.txt"
+    cat > "$CLIENT_DIR/client.yaml" <<EOF
 server: $DOMAIN:$PORT
 auth: $PASS
 
@@ -83,37 +90,30 @@ tls:
 
 socks5:
   listen: 127.0.0.1:1080
-
 http:
   listen: 127.0.0.1:1081
 EOF
+
+    echo "MODE=acme" > "$INFO_FILE"
+    echo "DOMAIN=$DOMAIN" >> "$INFO_FILE"
+    echo "PORT=$PORT" >> "$INFO_FILE"
 }
 
-# ────────────────────────────────────────────
-# 模式B：自签证书 + pinnedPeerCertSha256
-# ────────────────────────────────────────────
 gen_config_selfsign() {
-  PASS=$(openssl rand -base64 16 | tr -d "=+/")
-  mkdir -p /etc/hysteria
+    PASS=$(openssl rand -base64 32 | tr -d "=+/")
+    mkdir -p "$CONFIG_DIR" "$CLIENT_DIR"
 
-  # 生成自签证书
-  openssl ecparam -genkey -name prime256v1 -out /etc/hysteria/server.key 2>/dev/null
-  openssl req -new -x509 -days 36500 \
-    -key /etc/hysteria/server.key \
-    -out /etc/hysteria/server.crt \
-    -subj "/CN=bing.com" 2>/dev/null
+    openssl ecparam -genkey -name prime256v1 -out "$CONFIG_DIR/server.key" 2>/dev/null
+    openssl req -new -x509 -days 36500 -key "$CONFIG_DIR/server.key" -out "$CONFIG_DIR/server.crt" -subj "/CN=www.bing.com" 2>/dev/null
 
-  # 计算证书 SHA256 指纹（去掉冒号，转小写）
-  CERT_HASH=$(openssl x509 -in /etc/hysteria/server.crt -noout -fingerprint -sha256 \
-    | sed 's/.*=//;s/://g' | tr '[:upper:]' '[:lower:]')
-  yellow "证书指纹 (SHA256): $CERT_HASH"
+    CERT_HASH=$(openssl x509 -in "$CONFIG_DIR/server.crt" -noout -fingerprint -sha256 | sed 's/.*=//;s/://g' | tr '[:upper:]' '[:lower:]')
 
-  cat > /etc/hysteria/config.yaml <<EOF
+    cat > "$CONFIG_DIR/config.yaml" <<EOF
 listen: :$PORT
 
 tls:
-  cert: /etc/hysteria/server.crt
-  key: /etc/hysteria/server.key
+  cert: $CONFIG_DIR/server.crt
+  key: $CONFIG_DIR/server.key
 
 auth:
   type: password
@@ -122,41 +122,40 @@ auth:
 masquerade:
   type: proxy
   proxy:
-    url: https://bing.com
+    url: https://www.microsoft.com
     rewriteHost: true
 
 quic:
-  initStreamReceiveWindow: 16777216
+  initStreamReceiveWindow: 8388608
   maxStreamReceiveWindow: 16777216
   initConnReceiveWindow: 33554432
-  maxConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 67108864
 EOF
 
-  mkdir -p /root/hy2
-  # 用 pinSHA256 替代已废弃的 insecure=1，新版 V2rayNG/Xray 兼容
-  echo "hysteria2://$PASS@$IP:$PORT/?pinSHA256=$CERT_HASH&sni=bing.com#HY2-SelfSign" > /root/hy2/link.txt
-
-  cat > /root/hy2/client.yaml <<EOF
+    echo "hysteria2://$PASS@$IP:$PORT/?pinSHA256=$CERT_HASH&sni=www.bing.com#HY2-SelfSign" > "$CLIENT_DIR/link.txt"
+    cat > "$CLIENT_DIR/client.yaml" <<EOF
 server: $IP:$PORT
 auth: $PASS
 
 tls:
-  sni: bing.com
+  sni: www.bing.com
   pinSHA256: $CERT_HASH
 
 socks5:
   listen: 127.0.0.1:1080
-
 http:
   listen: 127.0.0.1:1081
 EOF
+
+    echo "MODE=selfsign" > "$INFO_FILE"
+    echo "PORT=$PORT" >> "$INFO_FILE"
+    yellow "证书指纹: $CERT_HASH"
 }
 
-# ────────────────────────────────────────────
-# systemd 服务
-# ────────────────────────────────────────────
+# ==================== 服务 & 优化 ====================
+
 start_service() {
-  cat > /etc/systemd/system/hysteria-server.service <<EOF
+    cat > "$SERVICE_FILE" <<'EOF'
 [Unit]
 Description=Hysteria2 Server
 After=network.target
@@ -164,127 +163,140 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
-Restart=on-failure
+Restart=always
 RestartSec=3
 LimitNOFILE=1048576
+LimitNPROC=512
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable hysteria-server >/dev/null 2>&1
-  systemctl restart hysteria-server
-
-  sleep 2
-  if systemctl is-active --quiet hysteria-server; then
-    green "服务启动成功"
-  else
-    red "服务启动失败，查看日志:"
-    journalctl -u hysteria-server -n 20 --no-pager
-    exit 1
-  fi
+    systemctl daemon-reload
+    systemctl enable --now hysteria-server
+    sleep 2
+    if systemctl is-active --quiet hysteria-server; then
+        green "服务启动成功 ✅"
+    else
+        red "服务启动失败"
+        journalctl -u hysteria-server -n 30 --no-pager
+    fi
 }
 
-# ────────────────────────────────────────────
-# 系统优化
-# ────────────────────────────────────────────
-optimize() {
-  local SYSCTL=/etc/sysctl.conf
+optimize_system() {
+    yellow "应用系统优化..."
+    cat >> /etc/sysctl.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.core.netdev_max_backlog=32768
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+EOF
+    sysctl -p >/dev/null 2>&1
 
-  add_sysctl() {
-    grep -q "^$1" "$SYSCTL" || echo "$1" >> "$SYSCTL"
-  }
-
-  add_sysctl "net.ipv4.ip_forward=1"
-  add_sysctl "net.ipv6.conf.all.forwarding=1"
-  add_sysctl "net.core.default_qdisc=fq"
-  add_sysctl "net.ipv4.tcp_congestion_control=bbr"
-  add_sysctl "net.core.rmem_max=33554432"
-  add_sysctl "net.core.wmem_max=33554432"
-
-  sysctl -p >/dev/null 2>&1
-
-  # 防火墙放行
-  iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null \
-    || iptables -I INPUT -p udp --dport "$PORT" -j ACCEPT
-  iptables -C FORWARD -j ACCEPT 2>/dev/null \
-    || iptables -I FORWARD -j ACCEPT
+    # 防火墙
+    if command -v ufw >/dev/null; then ufw allow $PORT/udp; fi
+    if command -v firewall-cmd >/dev/null; then firewall-cmd --add-port=$PORT/udp --permanent; firewall-cmd --reload; fi
+    iptables -I INPUT -p udp --dport $PORT -j ACCEPT 2>/dev/null || true
 }
 
-# ────────────────────────────────────────────
-# 主流程
-# ────────────────────────────────────────────
-main() {
-  clear
-  green "========================================"
-  green "       Hysteria2 安装脚本"
-  green "========================================"
-  echo ""
-
-  get_ip
-  echo ""
-
-  # 选择证书模式
-  echo "请选择证书模式:"
-  echo "  1) 域名 + ACME 自动证书（推荐，无需 insecure）"
-  echo "  2) 自签证书（兼容新版 V2rayNG，使用指纹锁定）"
-  echo ""
-  read -rp "请输入选项 [1/2]: " CERT_MODE
-
-  case "$CERT_MODE" in
-    1)
-      echo ""
-      read -rp "请输入你的域名 (例: vpn.example.com): " DOMAIN
-      [[ -z "$DOMAIN" ]] && red "域名不能为空" && exit 1
-
-      read -rp "请输入 ACME 邮箱 (用于证书申请通知): " EMAIL
-      [[ -z "$EMAIL" ]] && red "邮箱不能为空" && exit 1
-
-      yellow "请确保域名 $DOMAIN 的 A 记录已解析到 $IP"
-      read -rp "确认已解析？[y/N]: " CONFIRM
-      [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && red "请先完成 DNS 解析后再运行" && exit 1
-
-      install_hysteria
-      set_port
-      gen_config_acme
-      ;;
-    2)
-      install_hysteria
-      set_port
-      gen_config_selfsign
-      ;;
-    *)
-      red "无效选项" && exit 1
-      ;;
-  esac
-
-  optimize
-  start_service
-
-  echo ""
-  green "========================================"
-  green "           安装完成！"
-  green "========================================"
-  echo ""
-
-  if [[ "$CERT_MODE" == "1" ]]; then
-    echo "域名  : $DOMAIN"
-  else
-    echo "IP    : $IP"
-  fi
-  echo "端口  : $PORT"
-  echo "密码  : $PASS"
-  echo ""
-  yellow "连接链接 (直接导入客户端):"
-  cat /root/hy2/link.txt
-  echo ""
-  echo "客户端配置: /root/hy2/client.yaml"
-  echo "服务管理  : systemctl restart hysteria-server"
-  echo ""
-  if [[ "$CERT_MODE" == "2" ]]; then
-    yellow "提示: 使用 pinSHA256 指纹锁定，兼容新版 V2rayNG / Shadowrocket / NekoBox"
-  fi
+show_info() {
+    echo ""
+    blue "============= 连接信息 ============="
+    if [[ -f "$CLIENT_DIR/link.txt" ]]; then
+        cat "$CLIENT_DIR/link.txt"
+        echo ""
+        yellow "二维码（扫码导入客户端）:"
+        qrencode -t ANSIUTF8 < "$CLIENT_DIR/link.txt" 2>/dev/null || echo "未安装 qrencode，无法显示二维码"
+    fi
+    echo ""
+    echo "客户端配置: $CLIENT_DIR/client.yaml"
 }
 
-main
+uninstall() {
+    red "⚠️ 即将彻底卸载 Hysteria2"
+    read -rp "确认输入 y 继续: " confirm
+    [[ "$confirm" != "y" ]] && return
+
+    bash <(curl -fsSL https://get.hy2.sh/) --remove 2>/dev/null || true
+    rm -rf "$CONFIG_DIR" "$CLIENT_DIR" "$SERVICE_FILE" /var/lib/hysteria
+    systemctl disable --now hysteria-server 2>/dev/null
+    green "卸载完成，所有文件已清理"
+}
+
+# ==================== 主菜单 ====================
+
+main_menu() {
+    clear
+    green "========================================"
+    green "       Hysteria2 管理面板 (增强版)"
+    green "========================================"
+    get_ip
+    echo ""
+
+    check_installed && blue "状态: 已安装" || blue "状态: 未安装"
+
+    echo ""
+    echo "1) 全新安装 - 域名 + ACME（推荐）"
+    echo "2) 全新安装 - 自签证书"
+    echo "3) 查看连接信息 / 二维码"
+    echo "4) 重启服务"
+    echo "5) 查看实时日志"
+    echo "6) 一键卸载"
+    echo "0) 退出"
+    echo ""
+    read -rp "请输入选项: " choice
+
+    case "$choice" in
+        1|2)
+            check_dependencies
+            install_hysteria_bin
+            set_port
+            if [[ "$choice" == "1" ]]; then
+                read -rp "请输入域名: " DOMAIN
+                read -rp "请输入 ACME 邮箱: " EMAIL
+                gen_config_acme
+            else
+                gen_config_selfsign
+            fi
+            optimize_system
+            start_service
+            show_info
+            ;;
+        3)
+            show_info
+            ;;
+        4)
+            systemctl restart hysteria-server && green "服务已重启"
+            ;;
+        5)
+            journalctl -u hysteria-server -f
+            ;;
+        6)
+            uninstall
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            red "无效选项"
+            ;;
+    esac
+
+    echo ""
+    read -rp "按 Enter 返回主菜单..."
+    main_menu
+}
+
+set_port() {
+    read -rp "请输入监听端口 (默认 443，推荐 443 或 8443): " PORT
+    PORT=${PORT:-443}
+    if ss -tuln | grep -q ":$PORT "; then
+        yellow "端口 $PORT 被占用，建议更换"
+    fi
+}
+
+# ==================== 启动 ====================
+main_menu
