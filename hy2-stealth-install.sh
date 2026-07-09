@@ -39,10 +39,10 @@ install_hysteria_bin() {
 }
 
 choose_port() {
-    for p in 8443 8444 2053 2096 443; do
+    for p in 8443 8444 2053 2096; do
         if ! ss -tuln | grep -q ":$p "; then
             PORT=$p
-            yellow "自动选择端口: $PORT"
+            yellow "自动选择节点端口: $PORT"
             return
         fi
     done
@@ -50,18 +50,74 @@ choose_port() {
     yellow "使用端口: $PORT"
 }
 
+install_acme() {
+    yellow "检查并安装 acme.sh 及其依赖..."
+    apt-get update -y || yum update -y
+    apt-get install -y socat cron curl || yum install -y socat cronie curl
+    if ! command -v ~/.acme.sh/acme.sh &> /dev/null; then
+        curl https://get.acme.sh | sh -s email="$EMAIL"
+        source ~/.bashrc
+    fi
+    ~/.acme.sh/acme.sh --upgrade --auto-upgrade
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+}
+
+# 模式 1：Webroot 自动申请证书
 gen_config_acme() {
-    yellow "生成 ACME 配置..."
-    PASS=$(openssl rand -base64 32 | tr -d "=+/")
+    yellow "配置 ACME Webroot 自动续订模式..."
     mkdir -p "$CONFIG_DIR" "$CLIENT_DIR"
+    
+    install_acme
+
+    DEFAULT_WEBROOT="/www/sites/$DOMAIN"
+    echo ""
+    blue "利用现有的 Web 服务申请证书，网站零停机。"
+    read -rp "请输入网站根目录路径 (回车默认使用 $DEFAULT_WEBROOT): " WEBROOT
+    WEBROOT=${WEBROOT:-$DEFAULT_WEBROOT}
+
+    yellow "正在向 Let's Encrypt 申请证书..."
+    ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --webroot "$WEBROOT" \
+        --force || { red "证书申请失败！请检查域名解析和网站根目录是否匹配"; exit 1; }
+
+    ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" \
+        --key-file "$CONFIG_DIR/server.key" \
+        --fullchain-file "$CONFIG_DIR/server.crt" \
+        --reloadcmd "systemctl restart hysteria-server"
+
+    build_hy2_config
+}
+
+# 模式 2：手动填入现有证书路径或内容
+gen_config_manual_cert() {
+    yellow "配置自定义证书..."
+    mkdir -p "$CONFIG_DIR" "$CLIENT_DIR"
+
+    read -rp "请输入你的域名: " DOMAIN
+    read -rp "请输入证书 (.crt/pem) 文件绝对路径: " CRT_PATH
+    read -rp "请输入私钥 (.key) 文件绝对路径: " KEY_PATH
+
+    if [[ ! -f "$CRT_PATH" || ! -f "$KEY_PATH" ]]; then
+        red "未找到指定的证书或私钥文件，请检查路径！"
+        exit 1
+    fi
+
+    cp "$CRT_PATH" "$CONFIG_DIR/server.crt"
+    cp "$KEY_PATH" "$CONFIG_DIR/server.key"
+
+    build_hy2_config
+}
+
+# 生成 Hysteria2 统一配置文件
+build_hy2_config() {
+    chmod 644 "$CONFIG_DIR/server.key" "$CONFIG_DIR/server.crt"
+    PASS=$(openssl rand -base64 32 | tr -d "=+/")
 
     cat > "$CONFIG_DIR/config.yaml" <<EOF
 listen: :$PORT
 
-acme:
-  domains:
-    - $DOMAIN
-  email: $EMAIL
+tls:
+  cert: /etc/hysteria/server.crt
+  key: /etc/hysteria/server.key
 
 auth:
   type: password
@@ -87,10 +143,10 @@ http:
   listen: 127.0.0.1:1081
 EOF
 
-    echo "MODE=acme" > "$INFO_FILE"
+    echo "MODE=tls" > "$INFO_FILE"
     echo "DOMAIN=$DOMAIN" >> "$INFO_FILE"
     echo "PORT=$PORT" >> "$INFO_FILE"
-    green "ACME 配置完成"
+    green "Hysteria2 配置完毕！"
 }
 
 start_service() {
@@ -110,20 +166,27 @@ EOF
     systemctl daemon-reload
     systemctl enable --now hysteria-server
     sleep 2
-    systemctl is-active --quiet hysteria-server && green "服务启动成功" || red "服务启动失败"
+    if systemctl is-active --quiet hysteria-server; then 
+        green "服务启动成功"
+    else 
+        red "服务启动失败，请使用 journalctl -u hysteria-server -n 50 查看日志"
+    fi
 }
 
 optimize_system() {
-    yellow "系统优化..."
-    cat >> /etc/sysctl.conf <<EOF
+    yellow "开启 BBR & UDP 优化..."
+    cat > /etc/sysctl.d/99-hysteria.conf <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.core.rmem_max=67108864
 net.core.wmem_max=67108864
 net.ipv4.ip_forward=1
 EOF
-    sysctl -p >/dev/null 2>&1
+    sysctl --system >/dev/null 2>&1
+    
     iptables -I INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
+    firewall-cmd --add-port="${PORT}/udp" --permanent 2>/dev/null && firewall-cmd --reload 2>/dev/null
+    ufw allow "${PORT}/udp" 2>/dev/null
 }
 
 show_info() {
@@ -137,9 +200,12 @@ show_info() {
 uninstall() {
     red "⚠️ 确认卸载？(y/N)"
     read -r confirm
-    if [[ "$confirm" == "y" ]]; then
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         bash <(curl -fsSL https://get.hy2.sh/) --remove 2>/dev/null || true
-        rm -rf "$CONFIG_DIR" "$CLIENT_DIR" "$SERVICE_FILE"
+        systemctl disable --now hysteria-server 2>/dev/null
+        rm -rf "$CONFIG_DIR" "$CLIENT_DIR" "$SERVICE_FILE" /etc/sysctl.d/99-hysteria.conf
+        sysctl --system >/dev/null 2>&1
+        ~/.acme.sh/acme.sh --remove -d "$(grep DOMAIN "$INFO_FILE" 2>/dev/null | cut -d= -f2)" 2>/dev/null || true
         green "卸载完成"
     fi
 }
@@ -147,14 +213,14 @@ uninstall() {
 main_menu() {
     clear
     green "========================================"
-    green "       Hysteria2 完整管理面板"
+    green "    Hysteria2 管理面板 (兼容建站环境)   "
     green "========================================"
     get_ip
     echo ""
     check_installed
     echo ""
-    echo "1) 安装 - 域名 + ACME（推荐）"
-    echo "2) 安装 - 自签证书"
+    echo "1) 安装 - 自动 ACME 证书 (推荐: 无感全自动续订)"
+    echo "2) 安装 - 手动指定已有证书路径 (.crt / .key)"
     echo "3) 查看连接信息"
     echo "4) 重启服务"
     echo "5) 查看日志"
@@ -167,7 +233,7 @@ main_menu() {
         1)
             install_hysteria_bin
             choose_port
-            read -rp "请输入域名: " DOMAIN
+            read -rp "请输入节点域名 (需已解析到本服务器IP): " DOMAIN
             read -rp "请输入邮箱 (默认 hejianglong39@gmail.com): " EMAIL
             EMAIL=${EMAIL:-hejianglong39@gmail.com}
             gen_config_acme
@@ -178,7 +244,7 @@ main_menu() {
         2)
             install_hysteria_bin
             choose_port
-            gen_config_selfsign
+            gen_config_manual_cert
             optimize_system
             start_service
             show_info
@@ -193,14 +259,6 @@ main_menu() {
     echo ""
     read -rp "按 Enter 返回菜单..."
     main_menu
-}
-
-gen_config_selfsign() {
-    # 自签配置代码（省略，保持简洁）
-    PASS=$(openssl rand -base64 32 | tr -d "=+/")
-    mkdir -p "$CONFIG_DIR" "$CLIENT_DIR"
-    # ... (自签证书生成)
-    echo "MODE=selfsign" > "$INFO_FILE"
 }
 
 main_menu
