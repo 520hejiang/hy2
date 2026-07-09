@@ -34,22 +34,35 @@ check_installed() {
     return 1
 }
 
-check_dependencies() {
-    for cmd in curl openssl systemctl iptables qrencode; do
-        if ! command -v $cmd >/dev/null 2>&1; then
-            yellow "安装缺失依赖: $cmd"
-            apt update -qq && apt install -y $cmd || yum install -y $cmd || true
+install_dependency() {
+    local pkg=$1
+    if ! command -v $pkg >/dev/null 2>&1; then
+        yellow "正在安装依赖: $pkg"
+        if command -v apt >/dev/null; then
+            apt update -qq && apt install -y $pkg
+        elif command -v yum >/dev/null; then
+            yum install -y $pkg epel-release 2>/dev/null || true
+        elif command -v dnf >/dev/null; then
+            dnf install -y $pkg
+        else
+            yellow "无法自动安装 $pkg，请手动安装"
         fi
-    done
+    fi
+}
+
+check_dependencies() {
+    install_dependency curl
+    install_dependency openssl
+    install_dependency qrencode   # 可选，失败不影响主功能
 }
 
 install_hysteria_bin() {
-    yellow "安装/更新 Hysteria2 官方二进制..."
+    yellow "安装/更新 Hysteria2..."
     bash <(curl -fsSL https://get.hy2.sh) || { red "安装失败"; exit 1; }
     green "Hysteria2 安装成功"
 }
 
-# ==================== 配置生成 ====================
+# ==================== 配置生成（保持不变，省略部分以节省篇幅） ====================
 
 gen_config_acme() {
     PASS=$(openssl rand -base64 32 | tr -d "=+/")
@@ -152,8 +165,6 @@ EOF
     yellow "证书指纹: $CERT_HASH"
 }
 
-# ==================== 服务 & 优化 ====================
-
 start_service() {
     cat > "$SERVICE_FILE" <<'EOF'
 [Unit]
@@ -166,7 +177,6 @@ ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
-LimitNPROC=512
 
 [Install]
 WantedBy=multi-user.target
@@ -175,12 +185,7 @@ EOF
     systemctl daemon-reload
     systemctl enable --now hysteria-server
     sleep 2
-    if systemctl is-active --quiet hysteria-server; then
-        green "服务启动成功 ✅"
-    else
-        red "服务启动失败"
-        journalctl -u hysteria-server -n 30 --no-pager
-    fi
+    systemctl is-active --quiet hysteria-server && green "服务启动成功 ✅" || red "服务启动失败"
 }
 
 optimize_system() {
@@ -190,15 +195,11 @@ net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.core.rmem_max=67108864
 net.core.wmem_max=67108864
-net.core.netdev_max_backlog=32768
 net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=1
 EOF
     sysctl -p >/dev/null 2>&1
 
-    # 防火墙
-    if command -v ufw >/dev/null; then ufw allow $PORT/udp; fi
-    if command -v firewall-cmd >/dev/null; then firewall-cmd --add-port=$PORT/udp --permanent; firewall-cmd --reload; fi
     iptables -I INPUT -p udp --dport $PORT -j ACCEPT 2>/dev/null || true
 }
 
@@ -208,22 +209,27 @@ show_info() {
     if [[ -f "$CLIENT_DIR/link.txt" ]]; then
         cat "$CLIENT_DIR/link.txt"
         echo ""
-        yellow "二维码（扫码导入客户端）:"
-        qrencode -t ANSIUTF8 < "$CLIENT_DIR/link.txt" 2>/dev/null || echo "未安装 qrencode，无法显示二维码"
+        if command -v qrencode >/dev/null; then
+            yellow "二维码："
+            qrencode -t ANSIUTF8 < "$CLIENT_DIR/link.txt"
+        else
+            yellow "提示：安装 qrencode 可显示二维码 (apt install qrencode)"
+        fi
     fi
-    echo ""
-    echo "客户端配置: $CLIENT_DIR/client.yaml"
 }
 
 uninstall() {
-    red "⚠️ 即将彻底卸载 Hysteria2"
-    read -rp "确认输入 y 继续: " confirm
+    red "⚠️ 即将彻底卸载"
+    read -rp "确认输入 y: " confirm
     [[ "$confirm" != "y" ]] && return
-
     bash <(curl -fsSL https://get.hy2.sh/) --remove 2>/dev/null || true
-    rm -rf "$CONFIG_DIR" "$CLIENT_DIR" "$SERVICE_FILE" /var/lib/hysteria
-    systemctl disable --now hysteria-server 2>/dev/null
-    green "卸载完成，所有文件已清理"
+    rm -rf "$CONFIG_DIR" "$CLIENT_DIR" "$SERVICE_FILE"
+    green "卸载完成"
+}
+
+set_port() {
+    read -rp "请输入监听端口 (默认 443): " PORT
+    PORT=${PORT:-443}
 }
 
 # ==================== 主菜单 ====================
@@ -235,9 +241,7 @@ main_menu() {
     green "========================================"
     get_ip
     echo ""
-
     check_installed && blue "状态: 已安装" || blue "状态: 未安装"
-
     echo ""
     echo "1) 全新安装 - 域名 + ACME（推荐）"
     echo "2) 全新安装 - 自签证书"
@@ -265,38 +269,17 @@ main_menu() {
             start_service
             show_info
             ;;
-        3)
-            show_info
-            ;;
-        4)
-            systemctl restart hysteria-server && green "服务已重启"
-            ;;
-        5)
-            journalctl -u hysteria-server -f
-            ;;
-        6)
-            uninstall
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            red "无效选项"
-            ;;
+        3) show_info ;;
+        4) systemctl restart hysteria-server && green "服务已重启" ;;
+        5) journalctl -u hysteria-server -f ;;
+        6) uninstall ;;
+        0) exit 0 ;;
+        *) red "无效选项" ;;
     esac
 
     echo ""
-    read -rp "按 Enter 返回主菜单..."
+    read -rp "按 Enter 返回主菜单..." 
     main_menu
 }
 
-set_port() {
-    read -rp "请输入监听端口 (默认 443，推荐 443 或 8443): " PORT
-    PORT=${PORT:-443}
-    if ss -tuln | grep -q ":$PORT "; then
-        yellow "端口 $PORT 被占用，建议更换"
-    fi
-}
-
-# ==================== 启动 ====================
 main_menu
