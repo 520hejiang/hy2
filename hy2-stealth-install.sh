@@ -21,7 +21,13 @@ fi
 # 基础依赖
 echo ">>> 安装基础依赖..."
 apt-get update -qq
-apt-get install -y -qq curl socat cron jq >/dev/null
+apt-get install -y -qq curl socat cron jq dnsutils >/dev/null
+
+# 确保 dig 可用（dnsutils 可能在不同源中）
+if ! command -v dig >/dev/null; then
+    echo "dig 未安装，尝试安装 bind-host 或 dnsutils..."
+    apt-get install -y -qq bind9-host >/dev/null || true
+fi
 
 # 安装 acme.sh（如果尚未安装）
 ACME_HOME="$HOME/.acme.sh"
@@ -54,6 +60,23 @@ if [ "$DOMAIN_IP" != "$MY_IP" ]; then
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
         exit 1
     fi
+fi
+
+# 检查 80 端口是否被占用
+echo ">>> 检查 80 端口占用..."
+if command -v ss >/dev/null; then
+  if ss -tlnp | grep -E ':80\b' >/dev/null 2>&1; then
+    echo "⚠️  80 端口已被占用，这可能导致 standalone 验证失败。"
+    echo "请先停止占用该端口的服务（如 nginx、apache2 等）或者修改验证方式。"
+    read -rp "是否仍要继续尝试？(y/N): " CONTINUE_AFTER80
+    if [[ ! "$CONTINUE_AFTER80" =~ ^[Yy]$ ]]; then
+      exit 1
+    fi
+  else
+    echo "80 端口空闲。"
+  fi
+else
+  echo "无法检测端口占用（ss 命令不存在），跳过。"
 fi
 
 # 申请证书（standalone 模式，需要 80 端口空闲）
