@@ -24,6 +24,9 @@ INFO_FILE="/root/hy2/install.info"
 CUSTOM_PORT=""
 CUSTOM_MASQ=""
 
+# 记录被暂停的 Web 服务
+WEB_SERVICES_STOPPED=""
+
 get_ip() {
     IP=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null || curl -s --max-time 8 https://ifconfig.me 2>/dev/null)
     [[ -z "$IP" ]] && { red "无法获取公网 IP"; exit 1; }
@@ -86,27 +89,58 @@ get_masquerade_site() {
     yellow "伪装反代站点: $MASQ_URL"
 }
 
-# 模式 1：Webroot 网站零停机申请证书
+# 暂停占用80端口的 Web 服务
+stop_web_servers_if_needed() {
+    WEB_SERVICES_STOPPED=""
+    for srv in nginx apache2 httpd; do
+        if systemctl is-active --quiet "$srv" 2>/dev/null; then
+            systemctl stop "$srv" && WEB_SERVICES_STOPPED="$WEB_SERVICES_STOPPED $srv"
+        fi
+    done
+    if [ -n "$WEB_SERVICES_STOPPED" ]; then
+        blue "已暂停: ${WEB_SERVICES_STOPPED# }"
+    fi
+}
+
+# 恢复之前暂停的 Web 服务
+start_web_servers_if_needed() {
+    if [ -n "$WEB_SERVICES_STOPPED" ]; then
+        for srv in $WEB_SERVICES_STOPPED; do
+            systemctl start "$srv" >/dev/null 2>&1
+        done
+        blue "已恢复: ${WEB_SERVICES_STOPPED# }"
+        WEB_SERVICES_STOPPED=""
+    fi
+}
+
+# 模式 1：Standalone 模式 (暂停80端口)
 gen_config_acme() {
-    yellow "配置 ACME Webroot 模式..."
+    yellow "配置 ACME Standalone 模式..."
     mkdir -p "$CONFIG_DIR" "$CLIENT_DIR"
     
     install_acme
 
-    DEFAULT_WEBROOT="/www/sites/$DOMAIN"
     echo ""
-    blue "利用现有的 Web 服务申请证书，网站零停机。"
-    read -rp "请输入网站根目录绝对路径 (直接回车默认使用 $DEFAULT_WEBROOT): " WEBROOT
-    WEBROOT=${WEBROOT:-$DEFAULT_WEBROOT}
+    blue "将临时暂停占用80端口的 Web 服务，以完成 HTTP 验证。"
+    
+    # 暂停可能占用80端口的服务
+    stop_web_servers_if_needed
 
     yellow "正在向 Let's Encrypt 申请证书..."
-    ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --webroot "$WEBROOT" \
-        --force || { red "证书申请失败！请检查域名解析和根目录是否正确。"; exit 1; }
+    ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone --force || {
+        red "证书申请失败！请检查域名解析和80端口是否可用。"
+        # 恢复 Web 服务后退出
+        start_web_servers_if_needed
+        exit 1
+    }
 
     ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" \
         --key-file "$CONFIG_DIR/server.key" \
         --fullchain-file "$CONFIG_DIR/server.crt" \
         --reloadcmd "systemctl restart $SERVICE_NAME"
+
+    # 恢复 Web 服务
+    start_web_servers_if_needed
 
     chmod 644 "$CONFIG_DIR/server.key" "$CONFIG_DIR/server.crt"
     PASS=$(openssl rand -base64 16 | tr -d "=+/")
@@ -166,7 +200,7 @@ gen_config_selfsign() {
     green "指纹自签证书配置完成！"
 }
 
-# 模式 3：ACME DNS 验证 (Cloudflare)
+# 模式 3：ACME DNS 验证 (Cloudflare) 增加重试机制
 gen_config_acme_cf() {
     yellow "配置 ACME DNS (Cloudflare) 模式..."
     mkdir -p "$CONFIG_DIR" "$CLIENT_DIR"
@@ -179,10 +213,26 @@ gen_config_acme_cf() {
     export CF_Key="$CF_KEY"
 
     yellow "正在通过 Cloudflare DNS 验证申请证书..."
-    ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --force || {
+    MAX_RETRY=3
+    local success=0
+    for i in $(seq 1 $MAX_RETRY); do
+        if ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --force; then
+            green "证书申请成功 (尝试次数: $i)"
+            success=1
+            break
+        else
+            yellow "第 ${i} 次尝试失败..."
+            if [ $i -lt $MAX_RETRY ]; then
+                yellow "等待 15 秒后重试..."
+                sleep 15
+            fi
+        fi
+    done
+
+    if [ $success -ne 1 ]; then
         red "证书申请失败！请检查 Cloudflare 凭据和域名解析是否正确。"
         exit 1
-    }
+    fi
 
     ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" \
         --key-file "$CONFIG_DIR/server.key" \
@@ -349,9 +399,9 @@ main_menu() {
     echo ""
     check_installed
     echo ""
-    echo "1) 安装 - ACME 自动证书 (Webroot 网站无缝版)"
+    echo "1) 安装 - ACME 自动证书 (Standalone 模式，临时暂停80端口)"
     echo "2) 安装 - 自签证书 (指纹锁定 pinSHA256 防报错版)"
-    echo "3) 安装 - ACME DNS 验证 (Cloudflare)"
+    echo "3) 安装 - ACME DNS 验证 (Cloudflare) [增强重试]"
     echo "4) 查看连接信息"
     echo "5) 重启服务"
     echo "6) 查看运行日志"
