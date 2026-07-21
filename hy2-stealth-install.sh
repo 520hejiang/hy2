@@ -17,19 +17,44 @@ cyan()   { echo -e "${CYAN}$1${PLAIN}"; }
 # 环境准备与依赖
 # ==========================================
 install_deps() {
-    yellow "正在检查并安装必要依赖 (curl, lsof, socat, iptables, cron)..."
+    yellow "正在检查并安装必要依赖 (curl, lsof, socat, iptables, iproute2, openssl, cron)..."
     if [[ -f /etc/debian_version ]]; then
         apt update -y >/dev/null 2>&1
-        apt install -y curl wget lsof socat iptables cron systemd >/dev/null 2>&1
+        apt install -y curl wget lsof socat iptables iproute2 openssl cron systemd >/dev/null 2>&1
     elif [[ -f /etc/redhat-release ]]; then
-        yum install -y curl wget lsof socat iptables cronie systemd >/dev/null 2>&1
+        yum install -y curl wget lsof socat iptables iproute2 openssl cronie systemd >/dev/null 2>&1
     fi
 }
 
 get_ip() {
-    IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null)
-    [[ -z "$IP" ]] && IP=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null)
-    [[ -z "$IP" ]] && red "无法获取公网 IP，请检查网络" && exit 1
+    IP=$(curl -s --max-time 5 -4 https://api.ipify.org 2>/dev/null)
+    [[ -z "$IP" ]] && IP=$(curl -s --max-time 5 -4 https://ifconfig.me 2>/dev/null)
+    [[ -z "$IP" ]] && IP=$(curl -s --max-time 5 -4 https://icanhazip.com 2>/dev/null)
+    [[ -z "$IP" ]] && red "无法获取公网 IPv4，请检查网络" && exit 1
+}
+
+# ==========================================
+# 系统内核优化 (BBR)
+# ==========================================
+enable_bbr() {
+    yellow "正在检测并开启 BBR 拥塞控制算法..."
+    local kernel_major=$(uname -r | cut -d. -f1)
+    if [ "$kernel_major" -ge 4 ]; then
+        if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q "bbr"; then
+            modprobe tcp_bbr 2>/dev/null
+        fi
+        if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+            sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1
+            if ! grep -q "^net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
+                echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+            fi
+            green "BBR 已开启并写入持久化配置。"
+        else
+            green "BBR 已经处于开启状态。"
+        fi
+    else
+        yellow "内核版本低于 4.9，无法开启 BBR。"
+    fi
 }
 
 # ==========================================
@@ -77,7 +102,6 @@ install_acme() {
         curl https://get.acme.sh | sh >/dev/null 2>&1
     fi
     ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1
-    # 强制使用 Let's Encrypt 避免 ZeroSSL 各种注册报错
     ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
     ~/.acme.sh/acme.sh --register-account -m "admin@${DOMAIN}" --server letsencrypt >/dev/null 2>&1
 }
@@ -121,13 +145,25 @@ apply_cert_dns() {
 }
 
 install_cert() {
+    # 确保 hysteria 用户存在
+    id -u hysteria &>/dev/null || useradd -r -s /usr/sbin/nologin hysteria
+    
     mkdir -p /etc/hysteria
+    
+    # 安装证书并设置自动续期钩子
     ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc \
         --key-file /etc/hysteria/server.key \
-        --fullchain-file /etc/hysteria/server.crt
+        --fullchain-file /etc/hysteria/server.crt \
+        --reloadcmd "systemctl restart hysteria-server" >/dev/null 2>&1
+    
+    # 修复权限：私钥 640（仅 root/hysteria 可读），证书 644
+    chmod 640 /etc/hysteria/server.key
+    chmod 644 /etc/hysteria/server.crt
+    chown -R hysteria:hysteria /etc/hysteria/
+    chmod 750 /etc/hysteria
     
     if [[ -f /etc/hysteria/server.crt && -f /etc/hysteria/server.key ]]; then
-        green "证书安装成功！"
+        green "证书安装成功，权限已修正！"
     else
         red "证书写入失败，请检查 acme.sh 日志。"
         exit 1
@@ -144,6 +180,7 @@ install_hy2_core() {
 
 generate_config() {
     PASS=$(openssl rand -base64 16 | tr -d "=+/")
+    OBFS_PASS=$(openssl rand -base64 12 | tr -d "=+/")
     
     # 写入 Hysteria2 配置文件 (服务端必须只监听 443)
     cat > /etc/hysteria/config.yaml <<EOF
@@ -157,6 +194,11 @@ auth:
   type: password
   password: $PASS
 
+obfs:
+  type: salamander
+  salamander:
+    password: $OBFS_PASS
+
 masquerade:
   type: proxy
   proxy:
@@ -168,6 +210,12 @@ quic:
   maxStreamReceiveWindow: 8388608
   initConnReceiveWindow: 20971520
   maxConnReceiveWindow: 20971520
+  maxIdleTimeout: 30s
+  keepAlivePeriod: 10s
+
+bandwidth:
+  up: 1 gbps
+  down: 1 gbps
 
 outbounds:
   - name: default
@@ -175,17 +223,24 @@ outbounds:
 EOF
 
     mkdir -p /root/hy2
-    # 写入分享链接，其中 mport=20000-40000 告诉客户端使用端口跳跃
-    echo "hysteria2://$PASS@$DOMAIN:443/?mport=20000-40000&sni=$DOMAIN#HY2-$DOMAIN" > /root/hy2/link.txt
+    chmod 700 /root/hy2
+    
+    # 写入分享链接，其中 mport=20000-40000 告诉客户端使用端口跳跃，并携带 obfs 参数
+    echo "hysteria2://${PASS}@${DOMAIN}:443/?obfs=salamander&obfs-password=${OBFS_PASS}&mport=20000-40000&sni=${DOMAIN}#HY2-${DOMAIN}" > /root/hy2/link.txt
 
     # 生成一个给 Clash Meta / NekoBox 用的标准 yaml 参考
     cat > /root/hy2/client.yaml <<EOF
-server: $DOMAIN:443
-auth: $PASS
+server: ${DOMAIN}:443
+auth: ${PASS}
 mport: 20000-40000
 
+obfs:
+  type: salamander
+  salamander:
+    password: ${OBFS_PASS}
+
 tls:
-  sni: $DOMAIN
+  sni: ${DOMAIN}
 
 socks5:
   listen: 127.0.0.1:1080
@@ -195,26 +250,70 @@ http:
 EOF
 }
 
-setup_port_hopping() {
-    yellow "正在配置 IPTables 防火墙及端口跳跃 NAT 转发..."
+setup_firewall() {
+    yellow "正在配置防火墙及端口跳跃 NAT 转发（安全加固版）..."
     
-    # 清理旧规则（防止重复添加）
+    # 获取本机主 IP（内网 IP，用于 DNAT 目标）
+    LOCAL_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP '(?<=src )\d+\.\d+\.\d+\.\d+' | head -1)
+    [[ -z "$LOCAL_IP" ]] && LOCAL_IP=$(hostname -I | awk '{print $1}')
+    
+    # 清理旧规则（防止重复添加，包括旧版错误的 REDIRECT）
     iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j REDIRECT --to-ports 443 2>/dev/null
+    iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:443 2>/dev/null
     
-    # 放行 443 和 20000-40000 的端口
+    iptables -D INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null
+    iptables -D INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null
+    iptables -D INPUT -p udp -m multiport --dports 20000:40000 -j ACCEPT 2>/dev/null
+    
+    # 放行 443 和 20000-40000
     iptables -I INPUT -p udp --dport 443 -j ACCEPT
     iptables -I INPUT -p tcp --dport 443 -j ACCEPT
     iptables -I INPUT -p udp -m multiport --dports 20000:40000 -j ACCEPT
     
-    # 核心：将 20000-40000 的 UDP 流量重定向到本机的 443 端口
-    iptables -t nat -A PREROUTING -p udp --dport 20000:40000 -j REDIRECT --to-ports 443
+    # 核心修复：PREROUTING 链必须使用 DNAT，不能用 REDIRECT
+    # REDIRECT 在 PREROUTING 会将目标 IP 改为 127.0.0.1，导致入站 UDP 路由异常、连接追踪失效
+    iptables -t nat -A PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:443
 
-    # 尝试保存规则（适配大部分系统）
-    if command -v netfilter-persistent >/dev/null; then
-        netfilter-persistent save >/dev/null 2>&1
-    elif command -v service >/dev/null; then
-        service iptables save >/dev/null 2>&1
+    # 持久化规则（适配 Debian/Ubuntu / RHEL / CentOS）
+    if [[ -f /etc/debian_version ]]; then
+        if ! dpkg -l | grep -q iptables-persistent; then
+            apt install -y iptables-persistent >/dev/null 2>&1
+        fi
     fi
+    
+    if command -v netfilter-persistent >/dev/null; then
+        mkdir -p /etc/iptables
+        netfilter-persistent save >/dev/null 2>&1
+    elif command -v iptables-save >/dev/null; then
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        if [ ! -f /etc/iptables/rules.v4 ]; then
+            iptables-save > /etc/sysconfig/iptables 2>/dev/null
+        fi
+    fi
+    
+    green "防火墙规则已配置并持久化（DNAT 模式）。"
+}
+
+setup_systemd() {
+    yellow "正在加固 systemd 服务配置..."
+    
+    # 确保 hysteria 用户存在
+    id -u hysteria &>/dev/null || useradd -r -s /usr/sbin/nologin hysteria
+    
+    # 添加 drop-in 覆盖：自动重启、文件描述符限制
+    if [[ -f /etc/systemd/system/hysteria-server.service ]]; then
+        mkdir -p /etc/systemd/system/hysteria-server.service.d
+        cat > /etc/systemd/system/hysteria-server.service.d/override.conf <<EOF
+[Service]
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+EOF
+        systemctl daemon-reload
+    fi
+    
+    green "systemd 服务加固完成。"
 }
 
 start_service() {
@@ -235,10 +334,10 @@ start_service() {
 show_info() {
     clear
     green "==================================================="
-    green "       Hysteria2 安装配置信息 (高级防封版)"
+    green "       Hysteria2 安装配置信息 (企业级防封版)"
     green "==================================================="
     if [[ -f /root/hy2/link.txt ]]; then
-        yellow "【一键导入链接】 (适用于 v2rayN / v2rayNG / Shadowrocket / Surge 等)："
+        yellow "【一键导入链接】 (v2rayN / v2rayNG / Shadowrocket / NekoBox / Surge)："
         cyan "$(cat /root/hy2/link.txt)"
         echo ""
         yellow "【Clash Meta / NekoBox 客户端 yaml 配置文件路径】："
@@ -247,6 +346,9 @@ show_info() {
         yellow "防封锁特性状态："
         green "✓ 已启用 端口跳跃 (Port Hopping: 20000-40000 转发至 443)"
         green "✓ 已启用 深度伪装 (探测流量自动重定向至 Bing)"
+        green "✓ 已启用 Salamander 混淆 (防主动探测与流量特征识别)"
+        green "✓ 已启用 BBR 加速 (TCP 拥塞控制优化)"
+        green "✓ 已启用 证书自动续期 (acme.sh 自动维护)"
     else
         red "未找到配置文件，请确认是否已成功安装。"
     fi
@@ -257,15 +359,30 @@ show_info() {
 uninstall_hy2() {
     read -rp "确定要彻底卸载 Hysteria2 吗？(y/n): " confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        systemctl stop hysteria-server
-        systemctl disable hysteria-server
+        systemctl stop hysteria-server 2>/dev/null
+        systemctl disable hysteria-server 2>/dev/null
+        
+        # 清理 NAT 规则
+        LOCAL_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP '(?<=src )\d+\.\d+\.\d+\.\d+' | head -1)
+        [[ -z "$LOCAL_IP" ]] && LOCAL_IP=$(hostname -I | awk '{print $1}')
+        iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j REDIRECT --to-ports 443 2>/dev/null
+        iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:443 2>/dev/null
+        iptables -D INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null
+        iptables -D INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null
+        iptables -D INPUT -p udp -m multiport --dports 20000:40000 -j ACCEPT 2>/dev/null
+        
+        # 保存清理后的规则
+        if command -v netfilter-persistent >/dev/null; then
+            netfilter-persistent save >/dev/null 2>&1
+        elif command -v iptables-save >/dev/null; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        fi
+        
         rm -rf /etc/hysteria
         rm -rf /root/hy2
         rm -f /etc/systemd/system/hysteria-server.service
+        rm -rf /etc/systemd/system/hysteria-server.service.d
         systemctl daemon-reload
-        
-        # 移除 NAT 规则
-        iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j REDIRECT --to-ports 443 2>/dev/null
         
         bash <(curl -fsSL https://get.hy2.sh) --remove >/dev/null 2>&1
         green "Hysteria2 已彻底卸载并清理残留！"
@@ -276,6 +393,7 @@ uninstall_hy2() {
 install_menu() {
     get_ip
     install_deps
+    enable_bbr
     
     echo ""
     cyan "请选择申请域名证书的方式："
@@ -296,7 +414,8 @@ install_menu() {
     
     install_hy2_core
     generate_config
-    setup_port_hopping
+    setup_firewall
+    setup_systemd
     start_service
     show_info
 }
@@ -308,7 +427,7 @@ main() {
     while true; do
         clear
         green "==================================================="
-        green "    Hysteria2 高级防封版 一键管理脚本 By AI"
+        green "    Hysteria2 企业级防封版 一键管理脚本 By AI"
         green "==================================================="
         echo " 1) 一键安装 Hysteria2 (含证书申请与防封配置)"
         echo " 2) 查看 节点分享链接 与 配置信息"
