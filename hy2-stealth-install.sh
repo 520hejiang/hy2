@@ -15,8 +15,14 @@ blue()   { echo -e "${BLUE}$1${PLAIN}"; }
 
 CONFIG_DIR="/etc/hysteria"
 CLIENT_DIR="/root/hy2"
-SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
+# 伪装成普通系统服务名，降低特征
+SERVICE_NAME="system-network-monitor"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 INFO_FILE="/root/hy2/install.info"
+
+# 供 choose_port 使用的自定义端口（全局）
+CUSTOM_PORT=""
+CUSTOM_MASQ=""
 
 get_ip() {
     IP=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null || curl -s --max-time 8 https://ifconfig.me 2>/dev/null)
@@ -25,7 +31,7 @@ get_ip() {
 }
 
 check_installed() {
-    if systemctl is-active --quiet hysteria-server 2>/dev/null || [[ -f "$CONFIG_DIR/config.yaml" ]]; then
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null || [[ -f "$CONFIG_DIR/config.yaml" ]]; then
         green "Hysteria2 已安装"
         return 0
     fi
@@ -39,16 +45,23 @@ install_hysteria_bin() {
 }
 
 choose_port() {
-    # 避开 80 和 443 端口，防止与 OpenResty 冲突
-    for p in 8443 8444 2053 2096; do
-        if ! ss -tuln | grep -q ":$p "; then
-            PORT=$p
-            yellow "自动选择节点端口: $PORT"
-            return
+    if [[ -n "$CUSTOM_PORT" ]]; then
+        PORT="$CUSTOM_PORT"
+        yellow "使用自定义端口: $PORT"
+        if ss -tuln | grep -q ":$PORT "; then
+            red "端口 $PORT 已被占用！"
+            exit 1
+        fi
+        return
+    fi
+    # 随机选择高端口，提高隐蔽性
+    while true; do
+        PORT=$((10000 + RANDOM % 50000))
+        if ! ss -tuln | grep -q ":$PORT "; then
+            break
         fi
     done
-    PORT=8443
-    yellow "使用端口: $PORT"
+    yellow "随机选择节点端口: $PORT"
 }
 
 install_acme() {
@@ -61,6 +74,16 @@ install_acme() {
     fi
     ~/.acme.sh/acme.sh --upgrade --auto-upgrade
     ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+}
+
+get_masquerade_site() {
+    local defaults=("bing.com" "cloudflare.com" "mozilla.org" "github.com" "wikipedia.org")
+    if [[ -n "$CUSTOM_MASQ" ]]; then
+        MASQ_URL="$CUSTOM_MASQ"
+    else
+        MASQ_URL="${defaults[$RANDOM % ${#defaults[@]}]}"
+    fi
+    yellow "伪装反代站点: $MASQ_URL"
 }
 
 # 模式 1：Webroot 网站零停机申请证书
@@ -83,19 +106,24 @@ gen_config_acme() {
     ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" \
         --key-file "$CONFIG_DIR/server.key" \
         --fullchain-file "$CONFIG_DIR/server.crt" \
-        --reloadcmd "systemctl restart hysteria-server"
+        --reloadcmd "systemctl restart $SERVICE_NAME"
 
     chmod 644 "$CONFIG_DIR/server.key" "$CONFIG_DIR/server.crt"
     PASS=$(openssl rand -base64 16 | tr -d "=+/")
 
+    # 伪装站点
+    get_masquerade_site
+
     write_config_yaml
 
-    # ACME 证书是正规的，不需要指纹
+    # ACME 证书 sni 必须为真实域名，否则证书不匹配
+    CLIENT_SNI="$DOMAIN"
     echo "hysteria2://$PASS@$DOMAIN:$PORT/?sni=$DOMAIN#HY2-$DOMAIN" > "$CLIENT_DIR/link.txt"
     write_client_yaml "$DOMAIN" ""
 
     echo "MODE=tls" > "$INFO_FILE"
     echo "PORT=$PORT" >> "$INFO_FILE"
+    echo "SERVICE_NAME=$SERVICE_NAME" >> "$INFO_FILE"
     green "证书配置完成！"
 }
 
@@ -122,14 +150,19 @@ gen_config_selfsign() {
     chmod 644 "$CONFIG_DIR/server.key" "$CONFIG_DIR/server.crt"
     PASS=$(openssl rand -base64 16 | tr -d "=+/")
 
+    # 自签模式下伪装站点与 SNI 一致，避免特征差异
+    MASQ_URL="$SNI_DOMAIN"
+
     write_config_yaml
 
+    CLIENT_SNI="$SNI_DOMAIN"
     # 使用指纹替代 insecure
     echo "hysteria2://$PASS@$IP:$PORT/?pinSHA256=$CERT_HASH&sni=$SNI_DOMAIN#HY2-SelfSign" > "$CLIENT_DIR/link.txt"
     write_client_yaml "$IP" "$CERT_HASH"
 
     echo "MODE=selfsigned" > "$INFO_FILE"
     echo "PORT=$PORT" >> "$INFO_FILE"
+    echo "SERVICE_NAME=$SERVICE_NAME" >> "$INFO_FILE"
     green "指纹自签证书配置完成！"
 }
 
@@ -149,7 +182,7 @@ auth:
 masquerade:
   type: proxy
   proxy:
-    url: https://bing.com
+    url: https://${MASQ_URL}
     rewriteHost: true
 
 # 引入旧代码的底层网络优化参数
@@ -169,7 +202,7 @@ write_client_yaml() {
 server: $SRV:$PORT
 auth: $PASS
 tls:
-  sni: bing.com
+  sni: ${CLIENT_SNI:-bing.com}
 EOF
 
     if [[ -n "$HASH" ]]; then
@@ -185,9 +218,9 @@ EOF
 }
 
 start_service() {
-    cat > "$SERVICE_FILE" <<'EOF'
+    cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Hysteria2 Server
+Description=System Network Monitor Service
 After=network.target
 
 [Service]
@@ -201,14 +234,14 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now hysteria-server >/dev/null 2>&1
-    systemctl restart hysteria-server
+    systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1
+    systemctl restart "$SERVICE_NAME"
     sleep 2
-    if systemctl is-active --quiet hysteria-server; then 
+    if systemctl is-active --quiet "$SERVICE_NAME"; then 
         green "服务启动成功"
     else 
         red "服务启动失败，查看日志:"
-        journalctl -u hysteria-server -n 10 --no-pager
+        journalctl -u "$SERVICE_NAME" -n 10 --no-pager
     fi
 }
 
@@ -222,10 +255,19 @@ net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.core.rmem_max=33554432
 net.core.wmem_max=33554432
+net.ipv4.icmp_echo_ignore_all=1
+net.ipv4.tcp_fastopen=3
+fs.file-max=1048576
 EOF
     sysctl --system >/dev/null 2>&1
+
+    modprobe xt_connlimit 2>/dev/null || true
     
-    iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$PORT" -j ACCEPT
+    # 单 IP 并发连接数上限，防止扫描/暴力探测
+    iptables -C INPUT -p udp --dport "$PORT" -m connlimit --connlimit-above 100 -j DROP 2>/dev/null || \
+        iptables -I INPUT -p udp --dport "$PORT" -m connlimit --connlimit-above 100 -j DROP
+    iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || \
+        iptables -A INPUT -p udp --dport "$PORT" -j ACCEPT
     iptables -C FORWARD -j ACCEPT 2>/dev/null || iptables -I FORWARD -j ACCEPT
     firewall-cmd --add-port="${PORT}/udp" --permanent 2>/dev/null && firewall-cmd --reload 2>/dev/null
     ufw allow "${PORT}/udp" 2>/dev/null
@@ -236,7 +278,7 @@ show_info() {
     cat "$CLIENT_DIR/link.txt" 2>/dev/null || echo "未找到配置"
     echo "======================================"
     yellow "服务状态:"
-    systemctl status hysteria-server --no-pager -l 2>/dev/null | grep -E "Active:|Server up" || echo "服务未运行"
+    systemctl status "$SERVICE_NAME" --no-pager -l 2>/dev/null | grep -E "Active:|Server up" || echo "服务未运行"
 }
 
 uninstall() {
@@ -244,10 +286,15 @@ uninstall() {
     read -r confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         bash <(curl -fsSL https://get.hy2.sh/) --remove 2>/dev/null || true
-        systemctl disable --now hysteria-server 2>/dev/null
+        if [[ -f "$INFO_FILE" ]]; then
+            local srv_name=$(grep "^SERVICE_NAME=" "$INFO_FILE" | cut -d= -f2)
+            [[ -n "$srv_name" ]] && systemctl disable --now "$srv_name" 2>/dev/null
+        fi
+        systemctl disable --now "$SERVICE_NAME" 2>/dev/null
         rm -rf "$CONFIG_DIR" "$CLIENT_DIR" "$SERVICE_FILE" /etc/sysctl.d/99-hysteria.conf
         sysctl --system >/dev/null 2>&1
-        ~/.acme.sh/acme.sh --remove -d "$(grep DOMAIN "$INFO_FILE" 2>/dev/null | cut -d= -f2)" 2>/dev/null || true
+        local domain_to_remove=$(grep DOMAIN "$INFO_FILE" 2>/dev/null | cut -d= -f2)
+        [[ -n "$domain_to_remove" ]] && ~/.acme.sh/acme.sh --remove -d "$domain_to_remove" 2>/dev/null || true
         green "卸载完成！"
     fi
 }
@@ -274,10 +321,13 @@ main_menu() {
     case "$choice" in
         1)
             install_hysteria_bin
+            read -rp "请输入希望使用的端口 (直接回车随机生成 10000-60000): " user_port
+            CUSTOM_PORT="$user_port"
             choose_port
             read -rp "请输入节点域名 (需已解析到本机): " DOMAIN
             read -rp "请输入邮箱 (默认 admin@$DOMAIN): " EMAIL
             EMAIL=${EMAIL:-admin@$DOMAIN}
+            read -rp "请输入伪装反代网站域名 (直接回车随机选择知名站点): " CUSTOM_MASQ
             gen_config_acme
             optimize_system
             start_service
@@ -285,6 +335,8 @@ main_menu() {
             ;;
         2)
             install_hysteria_bin
+            read -rp "请输入希望使用的端口 (直接回车随机生成 10000-60000): " user_port
+            CUSTOM_PORT="$user_port"
             choose_port
             gen_config_selfsign
             optimize_system
@@ -292,8 +344,8 @@ main_menu() {
             show_info
             ;;
         3) show_info ;;
-        4) systemctl restart hysteria-server && green "重启成功" ;;
-        5) journalctl -u hysteria-server -f -n 100 ;;
+        4) systemctl restart "$SERVICE_NAME" && green "重启成功" ;;
+        5) journalctl -u "$SERVICE_NAME" -f -n 100 ;;
         6) uninstall ;;
         0) exit 0 ;;
         *) red "无效选项" ;;
