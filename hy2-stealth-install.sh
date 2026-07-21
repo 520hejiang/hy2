@@ -166,6 +166,47 @@ gen_config_selfsign() {
     green "指纹自签证书配置完成！"
 }
 
+# 模式 3：ACME DNS 验证 (Cloudflare)
+gen_config_acme_cf() {
+    yellow "配置 ACME DNS (Cloudflare) 模式..."
+    mkdir -p "$CONFIG_DIR" "$CLIENT_DIR"
+
+    install_acme
+
+    echo ""
+    blue "使用 Cloudflare DNS API 验证域名所有权。请确保域名已解析到本机且 Cloudflare 未开启橙色云代理。"
+    export CF_Email="$CF_EMAIL"
+    export CF_Key="$CF_KEY"
+
+    yellow "正在通过 Cloudflare DNS 验证申请证书..."
+    ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" --force || {
+        red "证书申请失败！请检查 Cloudflare 凭据和域名解析是否正确。"
+        exit 1
+    }
+
+    ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" \
+        --key-file "$CONFIG_DIR/server.key" \
+        --fullchain-file "$CONFIG_DIR/server.crt" \
+        --reloadcmd "systemctl restart $SERVICE_NAME"
+
+    chmod 644 "$CONFIG_DIR/server.key" "$CONFIG_DIR/server.crt"
+    PASS=$(openssl rand -base64 16 | tr -d "=+/")
+
+    get_masquerade_site
+
+    write_config_yaml
+
+    CLIENT_SNI="$DOMAIN"
+    echo "hysteria2://$PASS@$DOMAIN:$PORT/?sni=$DOMAIN#HY2-CFDNS" > "$CLIENT_DIR/link.txt"
+    write_client_yaml "$DOMAIN" ""
+
+    echo "MODE=tls_cf" > "$INFO_FILE"
+    echo "PORT=$PORT" >> "$INFO_FILE"
+    echo "SERVICE_NAME=$SERVICE_NAME" >> "$INFO_FILE"
+    echo "DOMAIN=$DOMAIN" >> "$INFO_FILE"
+    green "Cloudflare DNS 证书配置完成！"
+}
+
 # 提取出的公共写入配置函数 (融入了旧代码的 quic 性能优化)
 write_config_yaml() {
     cat > "$CONFIG_DIR/config.yaml" <<EOF
@@ -310,13 +351,14 @@ main_menu() {
     echo ""
     echo "1) 安装 - ACME 自动证书 (Webroot 网站无缝版)"
     echo "2) 安装 - 自签证书 (指纹锁定 pinSHA256 防报错版)"
-    echo "3) 查看连接信息"
-    echo "4) 重启服务"
-    echo "5) 查看运行日志"
-    echo "6) 一键卸载"
+    echo "3) 安装 - ACME DNS 验证 (Cloudflare)"
+    echo "4) 查看连接信息"
+    echo "5) 重启服务"
+    echo "6) 查看运行日志"
+    echo "7) 一键卸载"
     echo "0) 退出"
     echo ""
-    read -rp "请选择 [0-6]: " choice
+    read -rp "请选择 [0-7]: " choice
 
     case "$choice" in
         1)
@@ -343,10 +385,27 @@ main_menu() {
             start_service
             show_info
             ;;
-        3) show_info ;;
-        4) systemctl restart "$SERVICE_NAME" && green "重启成功" ;;
-        5) journalctl -u "$SERVICE_NAME" -f -n 100 ;;
-        6) uninstall ;;
+        3)
+            install_hysteria_bin
+            read -rp "请输入希望使用的端口 (直接回车随机生成 10000-60000): " user_port
+            CUSTOM_PORT="$user_port"
+            choose_port
+            read -rp "请输入节点域名 (需已解析到本机): " DOMAIN
+            read -rp "请输入邮箱 (默认 admin@$DOMAIN): " EMAIL
+            EMAIL=${EMAIL:-admin@$DOMAIN}
+            read -rp "请输入 Cloudflare 账户邮箱: " CF_EMAIL
+            read -rsp "请输入 Cloudflare Global API Key (输入不会显示): " CF_KEY
+            echo
+            read -rp "请输入伪装反代网站域名 (直接回车随机选择知名站点): " CUSTOM_MASQ
+            gen_config_acme_cf
+            optimize_system
+            start_service
+            show_info
+            ;;
+        4) show_info ;;
+        5) systemctl restart "$SERVICE_NAME" && green "重启成功" ;;
+        6) journalctl -u "$SERVICE_NAME" -f -n 100 ;;
+        7) uninstall ;;
         0) exit 0 ;;
         *) red "无效选项" ;;
     esac
