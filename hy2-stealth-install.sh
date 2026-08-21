@@ -97,18 +97,18 @@ apply_cert_dns() {
 }
 
 install_cert() {
-    # 确保 hysteria 用户存在（证书文件统一存放在 /etc/hysteria，AnyTLS 也复用这一份）
+    # 确保 hysteria 用户存在（证书文件统一存放在 /etc/hysteria）
     id -u hysteria &>/dev/null || useradd -r -s /usr/sbin/nologin hysteria
 
     mkdir -p /etc/hysteria
 
-    # 安装证书，续期时同时重启 Hysteria2 和 AnyTLS(sing-box)，谁没装就静默跳过
+    # 安装证书，续期时自动重启 Hysteria2
     ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc \
         --key-file /etc/hysteria/server.key \
         --fullchain-file /etc/hysteria/server.crt \
-        --reloadcmd "systemctl restart hysteria-server 2>/dev/null; systemctl restart sing-box 2>/dev/null; true" >/dev/null 2>&1
+        --reloadcmd "systemctl restart hysteria-server 2>/dev/null; true" >/dev/null 2>&1
 
-    # 权限：私钥 640，证书 644；sing-box 以 root 运行可直接读取
+    # 权限：私钥 640，证书 644
     chmod 640 /etc/hysteria/server.key
     chmod 644 /etc/hysteria/server.crt
     chown -R hysteria:hysteria /etc/hysteria/
@@ -270,234 +270,6 @@ start_service() {
 }
 
 # ==========================================
-# AnyTLS 安装与配置 (基于 sing-box 内核)
-# 说明：复用 Hysteria2 申请的同一张真实证书，走标准 TLS 模式
-# （未使用 AnyTLS+REALITY 的实验性组合，因为那个模式目前客户端支持面更窄，
-#  小火箭是否兼容还不确定，稳定性优先）
-# ==========================================
-install_singbox_core() {
-    yellow "正在安装 sing-box 内核 (AnyTLS 依赖)..."
-    if command -v sing-box >/dev/null 2>&1; then
-        yellow "sing-box 已安装，跳过安装步骤。"
-        return
-    fi
-
-    if [[ -f /etc/debian_version ]]; then
-        mkdir -p /etc/apt/keyrings
-        curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc
-        chmod a+r /etc/apt/keyrings/sagernet.asc
-        cat > /etc/apt/sources.list.d/sagernet.sources <<EOF
-Types: deb
-URIs: https://deb.sagernet.org/
-Suites: *
-Components: *
-Enabled: yes
-Signed-By: /etc/apt/keyrings/sagernet.asc
-EOF
-        apt-get update -y >/dev/null 2>&1
-        apt-get install -y sing-box >/dev/null 2>&1
-    else
-        yellow "非 Debian/Ubuntu 系统，使用二进制方式安装..."
-        ARCH=$(uname -m)
-        case "$ARCH" in
-            x86_64) SB_ARCH="amd64" ;;
-            aarch64) SB_ARCH="arm64" ;;
-            *) red "暂不支持的架构: $ARCH"; exit 1 ;;
-        esac
-        SB_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name"' | head -1 | sed -E 's/.*"v([0-9.]+)".*/\1/')
-        curl -fsSL -o /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
-        tar -xzf /tmp/sing-box.tar.gz -C /tmp
-        install -m 755 /tmp/sing-box-${SB_VER}-linux-${SB_ARCH}/sing-box /usr/local/bin/sing-box
-
-        cat > /etc/systemd/system/sing-box.service <<EOF
-[Unit]
-Description=sing-box service
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
-Restart=always
-RestartSec=5
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-    fi
-
-    if ! command -v sing-box >/dev/null 2>&1; then
-        red "sing-box 安装失败，请检查网络。"
-        exit 1
-    fi
-    green "sing-box 内核安装成功。"
-}
-
-generate_anytls_config() {
-    ANYTLS_PASS=$(openssl rand -base64 18 | tr -d "=+/")
-
-    if lsof -iTCP:443 -sTCP:LISTEN -t >/dev/null 2>&1; then
-        yellow "检测到 TCP 443 端口已被占用（大概率是你的 openresty/1Panel）。"
-        read -rp "请为 AnyTLS 指定一个未占用的 TCP 端口 (直接回车使用默认 8443): " ANYTLS_PORT
-        [[ -z "$ANYTLS_PORT" ]] && ANYTLS_PORT=8443
-    else
-        ANYTLS_PORT=443
-    fi
-
-    mkdir -p /etc/sing-box
-    cat > /etc/sing-box/config.json <<EOF
-{
-  "log": { "level": "warn", "timestamp": true },
-  "inbounds": [
-    {
-      "type": "anytls",
-      "tag": "anytls-in",
-      "listen": "::",
-      "listen_port": ${ANYTLS_PORT},
-      "users": [
-        { "name": "user", "password": "${ANYTLS_PASS}" }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${DOMAIN}",
-        "certificate_path": "/etc/hysteria/server.crt",
-        "key_path": "/etc/hysteria/server.key"
-      }
-    }
-  ],
-  "outbounds": [
-    { "type": "direct", "tag": "direct" }
-  ]
-}
-EOF
-
-    mkdir -p /root/anytls
-    chmod 700 /root/anytls
-
-    echo "anytls://${ANYTLS_PASS}@${DOMAIN}:${ANYTLS_PORT}?sni=${DOMAIN}&insecure=0#AnyTLS-${DOMAIN}" > /root/anytls/link.txt
-    echo "${ANYTLS_PORT}" > /root/anytls/port.txt
-
-    cat > /root/anytls/client.json <<EOF
-{
-  "type": "anytls",
-  "tag": "anytls-out",
-  "server": "${DOMAIN}",
-  "server_port": ${ANYTLS_PORT},
-  "password": "${ANYTLS_PASS}",
-  "tls": {
-    "enabled": true,
-    "server_name": "${DOMAIN}"
-  }
-}
-EOF
-}
-
-setup_firewall_anytls() {
-    yellow "正在为 AnyTLS 放行端口 ${ANYTLS_PORT}/tcp..."
-    iptables -D INPUT -p tcp --dport ${ANYTLS_PORT} -j ACCEPT 2>/dev/null
-    iptables -I INPUT -p tcp --dport ${ANYTLS_PORT} -j ACCEPT
-
-    if command -v netfilter-persistent >/dev/null; then
-        netfilter-persistent save >/dev/null 2>&1
-    elif command -v iptables-save >/dev/null; then
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null
-        [ ! -f /etc/iptables/rules.v4 ] && iptables-save > /etc/sysconfig/iptables 2>/dev/null
-    fi
-    green "端口 ${ANYTLS_PORT}/tcp 已放行并持久化。"
-}
-
-start_anytls_service() {
-    systemctl daemon-reload
-    systemctl enable sing-box >/dev/null 2>&1
-    systemctl restart sing-box
-    sleep 2
-    if systemctl is-active --quiet sing-box; then
-        green "AnyTLS (sing-box) 启动成功！"
-    else
-        red "启动失败，请用 journalctl -u sing-box -n 50 查看日志。"
-    fi
-}
-
-install_anytls_menu() {
-    install_deps
-    get_ip
-
-    if [[ -f /etc/hysteria/server.crt && -f /etc/hysteria/server.key ]]; then
-        yellow "检测到已有证书（来自 Hysteria2 安装），AnyTLS 将复用这张证书。"
-        read -rp "请输入证书对应的域名 (需和 Hysteria2 一致): " DOMAIN
-        [[ -z "$DOMAIN" ]] && red "域名不能为空" && exit 1
-    else
-        yellow "未检测到已有证书，需先申请一张（同样走 Cloudflare DNS API，不碰 80 端口）。"
-        read -rp "请输入你的域名 (如 a.example.com): " DOMAIN
-        [[ -z "$DOMAIN" ]] && red "域名不能为空" && exit 1
-        apply_cert_dns
-    fi
-
-    install_singbox_core
-    generate_anytls_config
-    setup_firewall_anytls
-    start_anytls_service
-    show_anytls_info
-}
-
-show_anytls_info() {
-    clear
-    green "==================================================="
-    green "         AnyTLS 安装配置信息（防封更强版）"
-    green "==================================================="
-    if [[ -f /root/anytls/link.txt ]]; then
-        yellow "【一键导入链接】(NekoBox / sing-box 内核客户端 / 小火箭)："
-        cyan "$(cat /root/anytls/link.txt)"
-        echo ""
-        yellow "【sing-box outbound JSON】(链接导入失败时，手动填这里的参数)："
-        cyan "/root/anytls/client.json"
-        echo ""
-        yellow "提醒："
-        echo " - AnyTLS 是较新协议，各客户端的分享链接解析还没完全统一。"
-        echo " - 小火箭较新版本已支持 AnyTLS 协议类型，若导入链接失败，改用手动填参数。"
-        echo " - 证书复用的是 Hysteria2 那张真实证书，续期时两个服务会一起自动重启。"
-    else
-        red "未找到配置文件，请确认是否已成功安装。"
-    fi
-    echo ""
-    read -n 1 -s -r -p "按任意键返回主菜单..."
-}
-
-uninstall_anytls() {
-    read -rp "确定要彻底卸载 AnyTLS (sing-box) 吗？(y/n): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        systemctl stop sing-box 2>/dev/null
-        systemctl disable sing-box 2>/dev/null
-
-        if [[ -f /root/anytls/port.txt ]]; then
-            AP=$(cat /root/anytls/port.txt)
-            iptables -D INPUT -p tcp --dport ${AP} -j ACCEPT 2>/dev/null
-            if command -v netfilter-persistent >/dev/null; then
-                netfilter-persistent save >/dev/null 2>&1
-            elif command -v iptables-save >/dev/null; then
-                iptables-save > /etc/iptables/rules.v4 2>/dev/null
-            fi
-        fi
-
-        rm -rf /etc/sing-box
-        rm -rf /root/anytls
-
-        if [[ -f /etc/debian_version ]] && dpkg -l sing-box >/dev/null 2>&1; then
-            apt-get remove -y sing-box >/dev/null 2>&1
-        else
-            rm -f /usr/local/bin/sing-box
-            rm -f /etc/systemd/system/sing-box.service
-        fi
-        systemctl daemon-reload
-
-        green "AnyTLS 已彻底卸载并清理残留！"
-    fi
-    sleep 2
-}
-
-# ==========================================
 # 菜单与展示 (Hysteria2)
 # ==========================================
 show_info() {
@@ -584,33 +356,23 @@ main() {
     while true; do
         clear
         green "==================================================="
-        green "   Hysteria2 + AnyTLS 双协议防封版管理脚本 By AI"
+        green "   Hysteria2 防封版管理脚本 By AI"
         green "==================================================="
         echo " 1) 安装 Hysteria2 (UDP，端口跳跃 + Salamander 混淆)"
-        echo " 2) 安装 AnyTLS   (TCP，抗主动探测能力更强)"
-        echo " 3) 查看 Hysteria2 节点信息"
-        echo " 4) 查看 AnyTLS 节点信息"
-        echo " 5) 重启 Hysteria2 服务"
-        echo " 6) 重启 AnyTLS 服务"
-        echo " 7) 停止 Hysteria2 服务"
-        echo " 8) 停止 AnyTLS 服务"
-        echo " 9) 卸载 Hysteria2"
-        echo "10) 卸载 AnyTLS"
+        echo " 2) 查看 Hysteria2 节点信息"
+        echo " 3) 重启 Hysteria2 服务"
+        echo " 4) 停止 Hysteria2 服务"
+        echo " 5) 卸载 Hysteria2"
         echo " 0) 退出脚本"
         green "==================================================="
-        read -rp "请输入选项 [0-10]: " menu_choice
+        read -rp "请输入选项 [0-5]: " menu_choice
 
         case $menu_choice in
             1) install_menu ;;
-            2) install_anytls_menu ;;
-            3) show_info ;;
-            4) show_anytls_info ;;
-            5) systemctl restart hysteria-server && green "重启成功" && sleep 2 ;;
-            6) systemctl restart sing-box && green "重启成功" && sleep 2 ;;
-            7) systemctl stop hysteria-server && yellow "已停止" && sleep 2 ;;
-            8) systemctl stop sing-box && yellow "已停止" && sleep 2 ;;
-            9) uninstall_hy2 ;;
-            10) uninstall_anytls ;;
+            2) show_info ;;
+            3) systemctl restart hysteria-server && green "重启成功" && sleep 2 ;;
+            4) systemctl stop hysteria-server && yellow "已停止" && sleep 2 ;;
+            5) uninstall_hy2 ;;
             0) exit 0 ;;
             *) red "请输入正确的数字!" && sleep 2 ;;
         esac
