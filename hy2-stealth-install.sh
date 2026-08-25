@@ -102,10 +102,11 @@ install_cert() {
 
     mkdir -p /etc/hysteria
 
-    # 安装证书，续期时自动重启 Hysteria2
+    # 安装证书；--key-permissions 防止续期时私钥权限被重置回 600 以外的值，续期后自动重启 Hysteria2
     ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc \
         --key-file /etc/hysteria/server.key \
         --fullchain-file /etc/hysteria/server.crt \
+        --key-permissions 640 \
         --reloadcmd "systemctl restart hysteria-server 2>/dev/null; true" >/dev/null 2>&1
 
     # 权限：私钥 640，证书 644
@@ -131,8 +132,9 @@ install_hy2_core() {
 }
 
 generate_config() {
-    PASS=$(openssl rand -base64 16 | tr -d "=+/")
-    OBFS_PASS=$(openssl rand -base64 12 | tr -d "=+/")
+    # 32 字节随机密码（约 43 字符），长期节点更抗爆破
+    PASS=$(openssl rand -base64 32 | tr -d "=+/")
+    OBFS_PASS=$(openssl rand -base64 16 | tr -d "=+/")
 
     cat > /etc/hysteria/config.yaml <<EOF
 listen: :443
@@ -150,10 +152,11 @@ obfs:
   salamander:
     password: $OBFS_PASS
 
+# 伪装指向本机同域名站点（由 openresty 提供），证书/SNI/内容三者一致，比公共站伪装更强
 masquerade:
   type: proxy
   proxy:
-    url: https://www.bing.com
+    url: https://${DOMAIN}
     rewriteHost: true
 
 quic:
@@ -164,9 +167,8 @@ quic:
   maxIdleTimeout: 30s
   keepAlivePeriod: 10s
 
-bandwidth:
-  up: 1 gbps
-  down: 1 gbps
+# 服务端强制 BBR：忽略客户端带宽声明，速率曲线平滑、不易被固定高速率特征识别
+ignoreClientBandwidth: true
 
 outbounds:
   - name: default
@@ -200,23 +202,35 @@ EOF
 }
 
 setup_firewall() {
-    yellow "正在配置防火墙及端口跳跃 NAT 转发（安全加固版）..."
+    yellow "正在配置防火墙及端口跳跃 NAT 转发（安全加固版，IPv4 + IPv6）..."
 
     LOCAL_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP '(?<=src )\d+\.\d+\.\d+\.\d+' | head -1)
     [[ -z "$LOCAL_IP" ]] && LOCAL_IP=$(hostname -I | awk '{print $1}')
 
+    # 检测全局 IPv6 地址（无 v6 则自动跳过相关规则）
+    LOCAL_IP6=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-f:]+(?=/)' | head -1)
+
     iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j REDIRECT --to-ports 443 2>/dev/null
     iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:443 2>/dev/null
+    if [[ -n "$LOCAL_IP6" ]]; then
+        ip6tables -t nat -D PREROUTING -p udp --dport 20000:40000 -j REDIRECT --to-ports 443 2>/dev/null
+        ip6tables -t nat -D PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination [${LOCAL_IP6}]:443 2>/dev/null
+    fi
 
     iptables -D INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null
     iptables -D INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null
-    iptables -D INPUT -p udp -m multiport --dports 20000:40000 -j ACCEPT 2>/dev/null
-
     iptables -I INPUT -p udp --dport 443 -j ACCEPT
     iptables -I INPUT -p tcp --dport 443 -j ACCEPT
-    iptables -I INPUT -p udp -m multiport --dports 20000:40000 -j ACCEPT
 
     iptables -t nat -A PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:443
+
+    if [[ -n "$LOCAL_IP6" ]]; then
+        ip6tables -I INPUT -p udp --dport 443 -j ACCEPT
+        ip6tables -t nat -A PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination [${LOCAL_IP6}]:443
+        green "IPv6 端口跳跃规则已添加。"
+    else
+        yellow "未检测到全局 IPv6 地址，跳过 IPv6 端口跳跃配置。"
+    fi
 
     if [[ -f /etc/debian_version ]]; then
         if ! dpkg -l | grep -q iptables-persistent; then
@@ -230,8 +244,10 @@ setup_firewall() {
     elif command -v iptables-save >/dev/null; then
         mkdir -p /etc/iptables
         iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        command -v ip6tables-save >/dev/null && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
         if [ ! -f /etc/iptables/rules.v4 ]; then
             iptables-save > /etc/sysconfig/iptables 2>/dev/null
+            command -v ip6tables-save >/dev/null && ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null
         fi
     fi
 
@@ -250,6 +266,21 @@ setup_systemd() {
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
+
+# 沙箱加固：即使内核被攻破也锁死在最小权限
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/etc/hysteria
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 EOF
         systemctl daemon-reload
     fi
@@ -285,11 +316,12 @@ show_info() {
         cyan "/root/hy2/client.yaml"
         echo ""
         yellow "防封锁特性状态："
-        green "✓ 已启用 端口跳跃 (Port Hopping: 20000-40000 转发至 443)"
-        green "✓ 已启用 深度伪装 (探测流量自动重定向至 Bing)"
+        green "✓ 已启用 端口跳跃 (Port Hopping: 20000-40000 转发至 443, 含 IPv6)"
+        green "✓ 已启用 一致性伪装 (探测流量重定向至本机同域名站点)"
         green "✓ 已启用 Salamander 混淆 (防主动探测与流量特征识别)"
-        green "✓ 已启用 BBR 加速 (TCP 拥塞控制优化)"
-        green "✓ 已启用 证书自动续期 (acme.sh 自动维护)"
+        green "✓ 服务端强制 BBR 模式 (ignoreClientBandwidth, 流量曲线平滑)"
+        green "✓ 已启用 systemd 沙箱加固 (最小权限运行)"
+        green "✓ 已启用 证书自动续期 (acme.sh 自动维护, 私钥权限 640)"
     else
         red "未找到配置文件，请确认是否已成功安装。"
     fi
@@ -309,6 +341,11 @@ uninstall_hy2() {
         iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:443 2>/dev/null
         iptables -D INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null
         iptables -D INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null
+        if command -v ip6tables >/dev/null; then
+            LOCAL_IP6=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-f:]+(?=/)' | head -1)
+            [[ -n "$LOCAL_IP6" ]] && ip6tables -t nat -D PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination [${LOCAL_IP6}]:443 2>/dev/null
+            ip6tables -D INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null
+        fi
         iptables -D INPUT -p udp -m multiport --dports 20000:40000 -j ACCEPT 2>/dev/null
 
         if command -v netfilter-persistent >/dev/null; then
