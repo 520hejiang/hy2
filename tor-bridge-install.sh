@@ -74,6 +74,14 @@ install_deps() {
     echo "deb [signed-by=/usr/share/keyrings/tor-archive-keyring.gpg] https://deb.torproject.org/torproject.org ${CODENAME} main" > /etc/apt/sources.list.d/tor-official.list
 
     apt update -y >/dev/null 2>&1
+
+    # 将 Tor 官方源加入自动安全更新白名单（否则第三方源默认不会被 unattended-upgrades 升级）
+    cat > /etc/apt/apt.conf.d/51-unattended-upgrades-tor <<EOF
+Unattended-Upgrade::Allowed-Origins {
+	"TorProject:\${CODENAME}";
+};
+EOF
+
     apt install -y tor obfs4proxy deb.torproject.org-keyring iptables-persistent >/dev/null 2>&1 \
         || { red "Tor 安装失败，请检查软件源与系统版本"; exit 1; }
     green "Tor $(tor --version | grep -oP '\d+\.\d+(\.\d+){1,2}' | head -1) 及 obfs4 安装完成。"
@@ -229,7 +237,8 @@ uninstall_bridge() {
     tor_stop_all
     apt purge -y tor obfs4proxy deb.torproject.org-keyring >/dev/null 2>&1
     rm -rf /var/lib/tor /var/log/tor /etc/tor "$BRIDGE_INFO" /etc/apt/sources.list.d/tor-official.list
-    rm -f /usr/share/keyrings/tor-archive-keyring.gpg /etc/apparmor.d/disable/system_tor
+    rm -f /usr/share/keyrings/tor-archive-keyring.gpg /etc/apparmor.d/disable/system_tor \
+        /etc/apt/apt.conf.d/51-unattended-upgrades-tor
     green "Tor 桥接已彻底卸载。"
     sleep 2
 }
