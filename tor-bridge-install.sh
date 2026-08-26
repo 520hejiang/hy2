@@ -15,8 +15,31 @@ cyan()   { echo -e "${CYAN}$1${PLAIN}"; }
 
 [[ $EUID -ne 0 ]] && red "请使用 root 用户运行此脚本" && exit 1
 
+# 自愈 PATH：cron/su/最小化环境下 sbin 可能缺失，导致 iptables 等静默失败
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
 TORRC=/etc/tor/torrc
 BRIDGE_INFO=/root/tor-bridge-info.txt
+
+# Debian 用 tor.service，Ubuntu 22.04+ 用模板实例 tor@default.service，需自动适配
+detect_tor_unit() {
+    if systemctl list-unit-files 2>/dev/null | grep -q '^tor@default'; then
+        TOR_UNIT='tor@default'
+    else
+        TOR_UNIT='tor'
+    fi
+}
+
+tor_restart() {
+    detect_tor_unit
+    systemctl enable "$TOR_UNIT" >/dev/null 2>&1
+    systemctl restart "$TOR_UNIT"
+}
+
+tor_stop_all() {
+    systemctl disable --now 'tor@default' >/dev/null 2>&1
+    systemctl disable --now 'tor' >/dev/null 2>&1
+}
 
 get_ip() {
     IP=$(curl -s --max-time 5 -4 https://api.ipify.org 2>/dev/null)
@@ -53,7 +76,7 @@ install_deps() {
     apt update -y >/dev/null 2>&1
     apt install -y tor obfs4proxy deb.torproject.org-keyring iptables-persistent >/dev/null 2>&1 \
         || { red "Tor 安装失败，请检查软件源与系统版本"; exit 1; }
-    green "Tor $(tor --version | awk '{print $3}') 及 obfs4 安装完成。"
+    green "Tor $(tor --version | grep -oP '\d+\.\d+(\.\d+){1,2}' | head -1) 及 obfs4 安装完成。"
 }
 
 write_config() {
@@ -100,16 +123,18 @@ EOF
         apparmor_parser -R /etc/apparmor.d/system_tor 2>/dev/null
     fi
 
-    systemctl restart tor
+    tor_restart
 
-    yellow "等待 Tor 启动并生成桥接凭据（约 10-60 秒）..."
+    # 等待凭据生成；期间若服务意外未起则自动拉起（最长 150 秒）
+    yellow "等待 Tor 启动并生成桥接凭据（约 10-90 秒）..."
     local waited=0
-    while (( waited < 90 )); do
-        grep -q "^obfs4" /var/lib/tor/pt_state/obfs4_bridgeline.txt 2>/dev/null && break
+    while (( waited < 150 )); do
+        grep -q "^Bridge obfs4" /var/lib/tor/pt_state/obfs4_bridgeline.txt 2>/dev/null && break
+        systemctl is-active --quiet "$TOR_UNIT" 2>/dev/null || systemctl start "$TOR_UNIT" 2>/dev/null
         sleep 3; waited=$((waited+3))
     done
 
-    if ! grep -q "^obfs4" /var/lib/tor/pt_state/obfs4_bridgeline.txt 2>/dev/null; then
+    if ! grep -q "^Bridge obfs4" /var/lib/tor/pt_state/obfs4_bridgeline.txt 2>/dev/null; then
         red "凭据未生成，请执行 journalctl -u tor -n 50 排查"
         exit 1
     fi
@@ -138,9 +163,12 @@ close_firewall() {
 }
 
 save_info() {
-    # 强制 iat-mode=1：启用包间延迟抖动，对抗长期时序分析（牺牲延迟换强度）
-    CERT_LINE=$(grep "^obfs4" /var/lib/tor/pt_state/obfs4_bridgeline.txt | head -1 \
-        | sed "s|<IP ADDRESS>:<PORT>|${IP}:${OBFS4_PORT}|; s|iat-mode=[0-9]|iat-mode=1|")
+    # 桥接线三步处理：填入真实 IP/端口/指纹 -> 强制 iat-mode=1 时序混淆 -> 去掉客户端不需要的 Bridge 前缀
+    local FPR
+    FPR=$(awk 'NR==1{print $2}' /var/lib/tor/fingerprint 2>/dev/null)
+    CERT_LINE=$(grep "^Bridge obfs4" /var/lib/tor/pt_state/obfs4_bridgeline.txt | head -1 \
+        | sed "s|<IP ADDRESS>|${IP}|; s|<PORT>|${OBFS4_PORT}|; s|<FINGERPRINT>|${FPR}|; s|iat-mode=[0-9]|iat-mode=1|" \
+        | sed "s|^Bridge ||")
     cat > $BRIDGE_INFO <<EOF
 ===== Tor 私有桥接信息 =====
 桥接线路（已启用 iat-mode=1 时序混淆）：
@@ -177,7 +205,7 @@ renew_ports() {
     if [[ ! -f $TORRC ]]; then red "尚未安装桥接"; sleep 2; return; fi
     yellow "正在更换身份（重新生成密钥与桥接线）..."
     rm -rf /var/lib/tor/pt_state
-    systemctl restart tor
+    tor_restart
     sleep 5
     get_ip
     ORPORT=$(grep -oP '(?<=^ORPort )\d+' $TORRC)
@@ -185,7 +213,7 @@ renew_ports() {
     NICK=$(grep -oP '(?<=^Nickname ).+' $TORRC)
     local waited=0
     while (( waited < 90 )); do
-        grep -q "^obfs4" /var/lib/tor/pt_state/obfs4_bridgeline.txt 2>/dev/null && break
+        grep -q "^Bridge obfs4" /var/lib/tor/pt_state/obfs4_bridgeline.txt 2>/dev/null && break
         sleep 3; waited=$((waited+3))
     done
     save_info
@@ -198,8 +226,7 @@ uninstall_bridge() {
     ORPORT=$(grep -oP '(?<=^ORPort )\d+' $TORRC 2>/dev/null)
     OBFS4_PORT=$(grep -oP "(?<=obfs4 0\.0\.0\.0:)\d+" $TORRC 2>/dev/null)
     [[ -n "$ORPORT" ]] && close_firewall
-    systemctl stop tor 2>/dev/null
-    systemctl disable tor 2>/dev/null
+    tor_stop_all
     apt purge -y tor obfs4proxy deb.torproject.org-keyring >/dev/null 2>&1
     rm -rf /var/lib/tor /var/log/tor /etc/tor "$BRIDGE_INFO" /etc/apt/sources.list.d/tor-official.list
     rm -f /usr/share/keyrings/tor-archive-keyring.gpg /etc/apparmor.d/disable/system_tor
@@ -224,7 +251,7 @@ main() {
         case $choice in
             1) install_deps && write_config && sleep 2 ;;
             2) show_info ;;
-            3) systemctl restart tor && green "已重启" && sleep 2 ;;
+            3) detect_tor_unit && systemctl restart "$TOR_UNIT" && green "已重启 ($TOR_UNIT)" && sleep 2 ;;
             4) renew_ports && sleep 2 ;;
             5) uninstall_bridge ;;
             0) exit 0 ;;
