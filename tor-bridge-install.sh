@@ -41,9 +41,14 @@ install_deps() {
     apt install -y curl gnupg lsb-release ca-certificates >/dev/null 2>&1
 
     install -d /usr/share/keyrings /etc/apt/sources.list.d
+    CODENAME=$(lsb_release -cs 2>/dev/null)
+    case "$CODENAME" in
+        focal|jammy|noble|bullseye|bookworm|trixie|sid) : ;;
+        *) CODENAME=bookworm; yellow "当前发行版代号未被 Tor 官方源收录，回退使用 bookworm 源。" ;;
+    esac
     curl -fsSL https://deb.torproject.org/torproject.org/A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89.asc \
         | gpg --dearmor > /usr/share/keyrings/tor-archive-keyring.gpg 2>/dev/null
-    echo "deb [signed-by=/usr/share/keyrings/tor-archive-keyring.gpg] https://deb.torproject.org/torproject.org $(lsb_release -cs) main" > /etc/apt/sources.list.d/tor-official.list
+    echo "deb [signed-by=/usr/share/keyrings/tor-archive-keyring.gpg] https://deb.torproject.org/torproject.org ${CODENAME} main" > /etc/apt/sources.list.d/tor-official.list
 
     apt update -y >/dev/null 2>&1
     apt install -y tor obfs4proxy deb.torproject.org-keyring iptables-persistent >/dev/null 2>&1 \
@@ -55,7 +60,14 @@ write_config() {
     yellow "正在生成私有桥接配置..."
     get_ip
     mkdir -p /root
-    [[ -f $TORRC ]] && cp $TORRC ${TORRC}.bak.$(date +%s)
+    [[ -f $TORRC ]] && cp $TORRC "${TORRC}.bak.$(date +%s)"
+
+    # 重复安装时先移除上一轮端口的放行规则，避免 iptables 规则堆积
+    OLD_ORPORT=$(grep -oP '(?<=^ORPort )\d+' $TORRC 2>/dev/null)
+    OLD_OBFS4_PORT=$(grep -oP "(?<=obfs4 0\.0\.0\.0:)\d+" $TORRC 2>/dev/null)
+    [[ -n "$OLD_ORPORT" ]] && iptables -D INPUT -p tcp --dport "$OLD_ORPORT" -j ACCEPT 2>/dev/null
+    [[ -n "$OLD_OBFS4_PORT" ]] && iptables -D INPUT -p tcp --dport "$OLD_OBFS4_PORT" -j ACCEPT 2>/dev/null
+    command -v netfilter-persistent >/dev/null && netfilter-persistent save >/dev/null 2>&1
 
     ORPORT=$(rand_free_port 10000 "")
     OBFS4_PORT=$(rand_free_port 40000 "$ORPORT")
@@ -108,10 +120,10 @@ EOF
 }
 
 open_firewall() {
-    iptables -D INPUT -p tcp --dport $ORPORT -j ACCEPT 2>/dev/null
-    iptables -D INPUT -p tcp --dport $OBFS4_PORT -j ACCEPT 2>/dev/null
-    iptables -I INPUT -p tcp --dport $ORPORT -j ACCEPT
-    iptables -I INPUT -p tcp --dport $OBFS4_PORT -j ACCEPT
+    iptables -D INPUT -p tcp --dport "$ORPORT" -j ACCEPT 2>/dev/null
+    iptables -D INPUT -p tcp --dport "$OBFS4_PORT" -j ACCEPT 2>/dev/null
+    iptables -I INPUT -p tcp --dport "$ORPORT" -j ACCEPT
+    iptables -I INPUT -p tcp --dport "$OBFS4_PORT" -j ACCEPT
     if command -v netfilter-persistent >/dev/null; then
         netfilter-persistent save >/dev/null 2>&1
     elif command -v iptables-save >/dev/null; then
@@ -120,8 +132,8 @@ open_firewall() {
 }
 
 close_firewall() {
-    iptables -D INPUT -p tcp --dport $ORPORT -j ACCEPT 2>/dev/null
-    iptables -D INPUT -p tcp --dport $OBFS4_PORT -j ACCEPT 2>/dev/null
+    iptables -D INPUT -p tcp --dport "$ORPORT" -j ACCEPT 2>/dev/null
+    iptables -D INPUT -p tcp --dport "$OBFS4_PORT" -j ACCEPT 2>/dev/null
     command -v netfilter-persistent >/dev/null && netfilter-persistent save >/dev/null 2>&1
 }
 
@@ -189,7 +201,8 @@ uninstall_bridge() {
     systemctl stop tor 2>/dev/null
     systemctl disable tor 2>/dev/null
     apt purge -y tor obfs4proxy deb.torproject.org-keyring >/dev/null 2>&1
-    rm -rf /var/lib/tor /var/log/tor /etc/tor $BRIDGE_INFO /etc/apt/sources.list.d/tor-official.list
+    rm -rf /var/lib/tor /var/log/tor /etc/tor "$BRIDGE_INFO" /etc/apt/sources.list.d/tor-official.list
+    rm -f /usr/share/keyrings/tor-archive-keyring.gpg /etc/apparmor.d/disable/system_tor
     green "Tor 桥接已彻底卸载。"
     sleep 2
 }
