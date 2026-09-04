@@ -102,12 +102,15 @@ install_cert() {
 
     mkdir -p /etc/hysteria
 
-    # 安装证书；--key-permissions 防止续期时私钥权限被重置回 600 以外的值，续期后自动重启 Hysteria2
-    ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc \
+    # 安装证书；acme.sh v3.1.5 不支持 --key-permissions 参数（会导致 Unknown parameter
+    # 并在写文件前直接退出），权限靠下面的 chmod/chown 保证，续期后权限修正写在 reloadcmd 里
+    if ! ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --ecc \
         --key-file /etc/hysteria/server.key \
         --fullchain-file /etc/hysteria/server.crt \
-        --key-permissions 640 \
-        --reloadcmd "systemctl restart hysteria-server 2>/dev/null; true" >/dev/null 2>&1
+        --reloadcmd "chmod 640 /etc/hysteria/server.key; chmod 644 /etc/hysteria/server.crt; chown hysteria:hysteria /etc/hysteria/server.key /etc/hysteria/server.crt; systemctl restart hysteria-server 2>/dev/null; true"; then
+        red "证书写入失败，请检查 acme.sh 日志。"
+        exit 1
+    fi
 
     # 权限：私钥 640，证书 644
     chmod 640 /etc/hysteria/server.key
