@@ -205,20 +205,13 @@ EOF
 }
 
 setup_firewall() {
-    yellow "正在配置防火墙及端口跳跃 NAT 转发（安全加固版，IPv4 + IPv6）..."
+    yellow "正在配置防火墙及端口跳跃 NAT 转发（IPv4）..."
 
     LOCAL_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP '(?<=src )\d+\.\d+\.\d+\.\d+' | head -1)
     [[ -z "$LOCAL_IP" ]] && LOCAL_IP=$(hostname -I | awk '{print $1}')
 
-    # 检测全局 IPv6 地址（无 v6 则自动跳过相关规则）
-    LOCAL_IP6=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-f:]+(?=/)' | head -1)
-
     iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j REDIRECT --to-ports 443 2>/dev/null
     iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:443 2>/dev/null
-    if [[ -n "$LOCAL_IP6" ]]; then
-        ip6tables -t nat -D PREROUTING -p udp --dport 20000:40000 -j REDIRECT --to-ports 443 2>/dev/null
-        ip6tables -t nat -D PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination [${LOCAL_IP6}]:443 2>/dev/null
-    fi
 
     iptables -D INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null
     iptables -D INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null
@@ -226,14 +219,6 @@ setup_firewall() {
     iptables -I INPUT -p tcp --dport 443 -j ACCEPT
 
     iptables -t nat -A PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:443
-
-    if [[ -n "$LOCAL_IP6" ]]; then
-        ip6tables -I INPUT -p udp --dport 443 -j ACCEPT
-        ip6tables -t nat -A PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination [${LOCAL_IP6}]:443
-        green "IPv6 端口跳跃规则已添加。"
-    else
-        yellow "未检测到全局 IPv6 地址，跳过 IPv6 端口跳跃配置。"
-    fi
 
     if [[ -f /etc/debian_version ]]; then
         if ! dpkg -l | grep -q iptables-persistent; then
@@ -247,10 +232,8 @@ setup_firewall() {
     elif command -v iptables-save >/dev/null; then
         mkdir -p /etc/iptables
         iptables-save > /etc/iptables/rules.v4 2>/dev/null
-        command -v ip6tables-save >/dev/null && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
         if [ ! -f /etc/iptables/rules.v4 ]; then
             iptables-save > /etc/sysconfig/iptables 2>/dev/null
-            command -v ip6tables-save >/dev/null && ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null
         fi
     fi
 
@@ -319,7 +302,7 @@ show_info() {
         cyan "/root/hy2/client.yaml"
         echo ""
         yellow "防封锁特性状态："
-        green "✓ 已启用 端口跳跃 (Port Hopping: 20000-40000 转发至 443, 含 IPv6)"
+        green "✓ 已启用 端口跳跃 (Port Hopping: 20000-40000 转发至 443, IPv4)"
         green "✓ 已启用 一致性伪装 (探测流量重定向至本机同域名站点)"
         green "✓ 已启用 Salamander 混淆 (防主动探测与流量特征识别)"
         green "✓ 服务端强制 BBR 模式 (ignoreClientBandwidth, 流量曲线平滑)"
@@ -344,11 +327,6 @@ uninstall_hy2() {
         iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:443 2>/dev/null
         iptables -D INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null
         iptables -D INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null
-        if command -v ip6tables >/dev/null; then
-            LOCAL_IP6=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-f:]+(?=/)' | head -1)
-            [[ -n "$LOCAL_IP6" ]] && ip6tables -t nat -D PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination [${LOCAL_IP6}]:443 2>/dev/null
-            ip6tables -D INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null
-        fi
         iptables -D INPUT -p udp -m multiport --dports 20000:40000 -j ACCEPT 2>/dev/null
 
         if command -v netfilter-persistent >/dev/null; then
