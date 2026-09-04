@@ -71,7 +71,6 @@ install_acme() {
     fi
     ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1
     ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
-    ~/.acme.sh/acme.sh --register-account -m "admin@${DOMAIN}" --server letsencrypt >/dev/null 2>&1
 }
 
 apply_cert_dns() {
