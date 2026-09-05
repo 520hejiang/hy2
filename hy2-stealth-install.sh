@@ -58,11 +58,14 @@ enable_bbr() {
 }
 
 # ==========================================
-# 证书申请模块 (Acme.sh) —— 仅保留 DNS API 方式
-# 说明：已移除"自动启停 80 端口"申请方式。
-# 该服务器 80/443 端口由 1Panel 的 openresty 容器占用（管理面板 + 多个静态站点），
-# 强行停止/强杀该进程风险很高，且脚本无法自动恢复 Docker 容器，
-# 因此只保留完全不碰 80 端口的 DNS API 方式。
+# 证书模块
+# 方式1：Acme.sh + Cloudflare DNS API（需域名，完全不碰 80 端口）。
+#   说明：已移除"自动启停 80 端口"申请方式。
+#   该服务器 80/443 端口由 1Panel 的 openresty 容器占用（管理面板 + 多个静态站点），
+#   强行停止/强杀该进程风险很高，且脚本无法自动恢复 Docker 容器，
+#   因此只保留完全不碰 80 端口的 DNS API 方式。
+# 方式2：自签证书（无需域名，IP 直连，openssl 本地生成，有效期 100 年，无需续期，
+#   客户端用 pinSHA256 指纹锁定，兼容新版 V2rayNG / Shadowrocket / NekoBox）。
 # ==========================================
 install_acme() {
     if [[ ! -f ~/.acme.sh/acme.sh ]]; then
@@ -78,7 +81,9 @@ apply_cert_dns() {
     echo ""
     cyan "【Cloudflare API 证书申请】"
     yellow "获取方法: 登录CF -> 右上角我的个人资料 -> API 令牌 -> 创建令牌 -> 使用'编辑区域 DNS'模板"
-    read -rp "请输入 Cloudflare API Token: " CF_Token
+    # Token 静默输入（不回显），防屏幕偷窥
+    read -rsp "请输入 Cloudflare API Token: " CF_Token
+    echo ""
     read -rp "请输入 Cloudflare 账户 ID (Account ID): " CF_Account_ID
 
     export CF_Token="$CF_Token"
@@ -125,6 +130,48 @@ install_cert() {
     fi
 }
 
+gen_cert_selfsign() {
+    # 自签证书模式：无需域名，IP 直连；证书 100 年有效，无需续期
+    yellow "正在生成自签证书 (EC prime256v1，有效期 100 年)..."
+
+    # 确保 hysteria 用户存在（证书文件统一存放在 /etc/hysteria）
+    id -u hysteria &>/dev/null || useradd -r -s /usr/sbin/nologin hysteria
+
+    mkdir -p /etc/hysteria
+
+    openssl ecparam -genkey -name prime256v1 -out /etc/hysteria/server.key 2>/dev/null
+    if [[ ! -s /etc/hysteria/server.key ]]; then
+        red "私钥生成失败，请检查 openssl 是否可用。"
+        exit 1
+    fi
+
+    openssl req -new -x509 -days 36500 \
+        -key /etc/hysteria/server.key \
+        -out /etc/hysteria/server.crt \
+        -subj "/CN=bing.com" 2>/dev/null
+    if [[ ! -s /etc/hysteria/server.crt ]]; then
+        red "自签证书生成失败，请检查 openssl 是否可用。"
+        exit 1
+    fi
+
+    # 计算证书 SHA256 指纹（去冒号，转小写），供客户端 pinSHA256 锁定
+    CERT_HASH=$(openssl x509 -in /etc/hysteria/server.crt -noout -fingerprint -sha256 2>/dev/null \
+        | sed 's/.*=//;s/://g' | tr '[:upper:]' '[:lower:]')
+    if [[ -z "$CERT_HASH" ]]; then
+        red "证书指纹计算失败，请检查 openssl 是否可用。"
+        exit 1
+    fi
+    yellow "证书指纹 (SHA256): $CERT_HASH"
+
+    # 权限：私钥 640，证书 644（与 DNS 模式保持一致）
+    chmod 640 /etc/hysteria/server.key
+    chmod 644 /etc/hysteria/server.crt
+    chown -R hysteria:hysteria /etc/hysteria/
+    chmod 750 /etc/hysteria
+
+    green "自签证书生成成功，权限已修正！"
+}
+
 # ==========================================
 # Hysteria2 安装与防封配置
 # ==========================================
@@ -137,6 +184,25 @@ generate_config() {
     # 32 字节随机密码（约 43 字符），长期节点更抗爆破
     PASS=$(openssl rand -base64 32 | tr -d "=+/")
     OBFS_PASS=$(openssl rand -base64 16 | tr -d "=+/")
+
+    if [[ "$CERT_MODE" == "selfsign" ]]; then
+        # 自签模式：无域名，IP 直连；SNI 用 bing.com，客户端用 pinSHA256 锁定证书；
+        # 伪装指向公网 bing（本机无同域名站点可用）
+        ADDR="$IP"
+        MASQ_URL="https://www.bing.com"
+        LINK="hysteria2://${PASS}@${IP}:443/?obfs=salamander&obfs-password=${OBFS_PASS}&mport=20000-40000&pinSHA256=${CERT_HASH}&sni=bing.com#HY2-${IP}"
+        TLS_BLOCK="tls:
+  sni: bing.com
+  pinSHA256: ${CERT_HASH}"
+    else
+        # DNS 模式：域名连接，正规 CA 证书无需指纹锁定；
+        # 伪装指向本机同域名站点（由 openresty 提供），证书/SNI/内容三者一致
+        ADDR="$DOMAIN"
+        MASQ_URL="https://${DOMAIN}"
+        LINK="hysteria2://${PASS}@${DOMAIN}:443/?obfs=salamander&obfs-password=${OBFS_PASS}&mport=20000-40000&sni=${DOMAIN}#HY2-${DOMAIN}"
+        TLS_BLOCK="tls:
+  sni: ${DOMAIN}"
+    fi
 
     cat > /etc/hysteria/config.yaml <<EOF
 listen: :443
@@ -154,11 +220,11 @@ obfs:
   salamander:
     password: $OBFS_PASS
 
-# 伪装指向本机同域名站点（由 openresty 提供），证书/SNI/内容三者一致，比公共站伪装更强
+# 伪装配置（见上：DNS 模式指向本机同域名站点，自签模式指向公网 bing）
 masquerade:
   type: proxy
   proxy:
-    url: https://${DOMAIN}
+    url: ${MASQ_URL}
     rewriteHost: true
 
 quic:
@@ -180,10 +246,13 @@ EOF
     mkdir -p /root/hy2
     chmod 700 /root/hy2
 
-    echo "hysteria2://${PASS}@${DOMAIN}:443/?obfs=salamander&obfs-password=${OBFS_PASS}&mport=20000-40000&sni=${DOMAIN}#HY2-${DOMAIN}" > /root/hy2/link.txt
+    # 记录本次安装的证书模式，供 show_info 展示（老版本无此文件，缺省按 DNS 模式显示）
+    echo "$CERT_MODE" > /root/hy2/mode.txt
+
+    echo "$LINK" > /root/hy2/link.txt
 
     cat > /root/hy2/client.yaml <<EOF
-server: ${DOMAIN}:443
+server: ${ADDR}:443
 auth: ${PASS}
 mport: 20000-40000
 
@@ -192,8 +261,7 @@ obfs:
   salamander:
     password: ${OBFS_PASS}
 
-tls:
-  sni: ${DOMAIN}
+${TLS_BLOCK}
 
 socks5:
   listen: 127.0.0.1:1080
@@ -302,11 +370,15 @@ show_info() {
         echo ""
         yellow "防封锁特性状态："
         green "✓ 已启用 端口跳跃 (Port Hopping: 20000-40000 转发至 443, IPv4)"
-        green "✓ 已启用 一致性伪装 (探测流量重定向至本机同域名站点)"
+        if [[ -f /root/hy2/mode.txt && "$(cat /root/hy2/mode.txt)" == "selfsign" ]]; then
+            green "✓ 自签证书 (有效期 100 年，无需续期，客户端已用 pinSHA256 锁定)"
+        else
+            green "✓ 已启用 一致性伪装 (探测流量重定向至本机同域名站点)"
+            green "✓ 已启用 证书自动续期 (acme.sh 自动维护, 私钥权限 640)"
+        fi
         green "✓ 已启用 Salamander 混淆 (防主动探测与流量特征识别)"
         green "✓ 服务端强制 BBR 模式 (ignoreClientBandwidth, 流量曲线平滑)"
         green "✓ 已启用 systemd 沙箱加固 (最小权限运行)"
-        green "✓ 已启用 证书自动续期 (acme.sh 自动维护, 私钥权限 640)"
     else
         red "未找到配置文件，请确认是否已成功安装。"
     fi
@@ -334,6 +406,16 @@ uninstall_hy2() {
             iptables-save > /etc/iptables/rules.v4 2>/dev/null
         fi
 
+        # 清理 acme.sh 中的域名证书与续期任务（必须在删文件前先读出域名；
+        # 自签模式用 IP 直连、无 acme 证书可清；mode.txt 缺失的老版本按是否为 IP 判断）
+        if [[ -f /root/hy2/link.txt && -f ~/.acme.sh/acme.sh ]]; then
+            OLD_DOMAIN=$(grep -oP '(?<=@)[^:/?#]+(?=:443)' /root/hy2/link.txt | head -1)
+            if [[ -n "$OLD_DOMAIN" && ! "$OLD_DOMAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                yellow "正在清理 acme.sh 中 $OLD_DOMAIN 的证书与续期任务..."
+                ~/.acme.sh/acme.sh --remove -d "$OLD_DOMAIN" --ecc >/dev/null 2>&1
+            fi
+        fi
+
         rm -rf /etc/hysteria
         rm -rf /root/hy2
         rm -f /etc/systemd/system/hysteria-server.service
@@ -341,6 +423,12 @@ uninstall_hy2() {
         systemctl daemon-reload
 
         bash <(curl -fsSL https://get.hy2.sh) --remove >/dev/null 2>&1
+
+        # 删除 hysteria 系统用户（服务已停，无残留进程，此时删除安全）
+        if id -u hysteria &>/dev/null; then
+            userdel hysteria 2>/dev/null && green "hysteria 系统用户已删除。"
+        fi
+
         green "Hysteria2 已彻底卸载并清理残留！"
     fi
     sleep 2
@@ -352,11 +440,29 @@ install_menu() {
     enable_bbr
 
     echo ""
-    cyan "证书申请方式：Cloudflare DNS API（完全不占用 80 端口，不影响你现有的 openresty/1Panel 站点）"
-    read -rp "请输入你的域名 (如 a.example.com): " DOMAIN
-    [[ -z "$DOMAIN" ]] && red "域名不能为空" && exit 1
+    cyan "请选择证书模式："
+    echo " 1) Cloudflare DNS API（需域名，完全不占用 80 端口，不影响现有的 openresty/1Panel 站点）"
+    echo " 2) 自签证书（无需域名，IP 直连，有效期 100 年，无需续期）"
+    echo ""
+    read -rp "请输入选项 [1/2]: " CERT_MODE_CHOICE
 
-    apply_cert_dns
+    case "$CERT_MODE_CHOICE" in
+        1)
+            CERT_MODE="dns"
+            echo ""
+            read -rp "请输入你的域名 (如 a.example.com): " DOMAIN
+            [[ -z "$DOMAIN" ]] && red "域名不能为空" && exit 1
+
+            apply_cert_dns
+            ;;
+        2)
+            CERT_MODE="selfsign"
+            gen_cert_selfsign
+            ;;
+        *)
+            red "无效选项" && exit 1
+            ;;
+    esac
 
     install_hy2_core
     generate_config
