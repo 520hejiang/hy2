@@ -286,7 +286,7 @@ generate_config() {
         # 伪装指向公网 bing（本机无同域名站点可用）
         ADDR="$IP"
         MASQ_URL="https://www.bing.com"
-        LINK="hysteria2://${PASS}@${IP}:$PORT/?obfs=salamander&obfs-password=${OBFS_PASS}&mport=20000-40000&pinSHA256=${CERT_HASH}&sni=bing.com#HY2-${IP}"
+        LINK="hysteria2://${PASS}@${IP}:${PORT},20000-40000/?obfs=salamander&obfs-password=${OBFS_PASS}&pinSHA256=${CERT_HASH}&sni=bing.com#HY2-${IP}"
         TLS_BLOCK="tls:
   sni: bing.com
   pinSHA256: ${CERT_HASH}"
@@ -295,7 +295,7 @@ generate_config() {
         # 伪装指向本机同域名站点（由 openresty 提供），证书/SNI/内容三者一致
         ADDR="$DOMAIN"
         MASQ_URL="https://${DOMAIN}"
-        LINK="hysteria2://${PASS}@${DOMAIN}:$PORT/?obfs=salamander&obfs-password=${OBFS_PASS}&mport=20000-40000&sni=${DOMAIN}#HY2-${DOMAIN}"
+        LINK="hysteria2://${PASS}@${DOMAIN}:${PORT},20000-40000/?obfs=salamander&obfs-password=${OBFS_PASS}&sni=${DOMAIN}#HY2-${DOMAIN}"
         TLS_BLOCK="tls:
   sni: ${DOMAIN}"
     fi
@@ -348,9 +348,8 @@ EOF
     echo "$LINK" > /root/hy2/link.txt
 
     cat > /root/hy2/client.yaml <<EOF
-server: ${ADDR}:$PORT
+server: ${ADDR}:$PORT,20000-40000
 auth: ${PASS}
-mport: 20000-40000
 
 obfs:
   type: salamander
@@ -508,7 +507,7 @@ show_info() {
         cyan "/root/hy2/client.yaml"
         echo ""
         yellow "防封锁特性状态："
-        PORT_SHOW=$(grep -oP '(?<=:)[0-9]+(?=/\?)' /root/hy2/link.txt 2>/dev/null | head -1)
+        PORT_SHOW=$(grep -oP '(?<=:)[0-9]+(?=,|/\?)' /root/hy2/link.txt 2>/dev/null | head -1)
         [[ -z "$PORT_SHOW" ]] && PORT_SHOW="443"
         green "✓ 已启用 端口跳跃 (Port Hopping: 20000-40000 转发至 ${PORT_SHOW}, IPv4)"
         if [[ -f /root/hy2/mode.txt && "$(cat /root/hy2/mode.txt)" == "selfsign" ]]; then
@@ -534,7 +533,7 @@ uninstall_hy2() {
         systemctl disable hysteria-server 2>/dev/null
 
         # 本次安装使用的端口（老版本无此信息则按 443 清理）
-        UPORT=$(grep -oP '(?<=:)[0-9]+(?=/\?)' /root/hy2/link.txt 2>/dev/null | head -1)
+        UPORT=$(grep -oP '(?<=:)[0-9]+(?=,|/\?)' /root/hy2/link.txt 2>/dev/null | head -1)
         [[ -z "$UPORT" ]] && UPORT=443
 
         LOCAL_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP '(?<=src )\d+\.\d+\.\d+\.\d+' | head -1)
