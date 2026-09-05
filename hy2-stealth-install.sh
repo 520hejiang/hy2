@@ -16,8 +16,23 @@ cyan()   { echo -e "${CYAN}$1${PLAIN}"; }
 # ==========================================
 # 环境准备与依赖
 # ==========================================
-install_deps() {
-    # 先检查关键命令，齐了就跳过 apt（最常见的"卡死"就是 apt 在这里无提示等待）
+# 等待 apt/dpkg 锁释放（unattended-upgrades 经常占着锁），带提示+300s上限；
+# 返回0=锁空闲可继续，1=超时。fuser 不存在时直接放行。
+wait_apt_lock() {
+    local waited=0
+    while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock >/dev/null 2>&1; do
+        waited=$((waited + 10))
+        if [[ $waited -ge 300 ]]; then
+            red "等待 apt 锁超时（300s），请稍后手动执行 apt install 后再重试。"
+            return 1
+        fi
+        yellow "检测到 apt 被占用（一般是系统自动更新），等待锁释放... (${waited}s/300s)"
+        sleep 10
+    done
+    return 0
+}
+
+install_deps() {    # 先检查关键命令，齐了就跳过 apt（最常见的"卡死"就是 apt 在这里无提示等待）
     local need=(curl openssl iptables ip)
     local missing=()
     local cmd
@@ -32,16 +47,7 @@ install_deps() {
     yellow "缺失依赖: ${missing[*]}，正在安装 (curl wget lsof socat iptables iproute2 openssl cron gnupg)..."
 
     # 等待 apt/dpkg 锁释放（unattended-upgrades 经常占着锁），带提示+上限，不再无声卡死
-    local waited=0
-    while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock >/dev/null 2>&1; do
-        waited=$((waited + 10))
-        if [[ $waited -ge 300 ]]; then
-            red "等待 apt 锁超时（300s），请稍后手动执行 apt install 后再重试。"
-            return 1
-        fi
-        yellow "检测到 apt 被占用（一般是系统自动更新），等待锁释放... (${waited}s/300s)"
-        sleep 10
-    done
+    wait_apt_lock || return 1
 
     local apt_opts=(-o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2)
     if [[ -f /etc/debian_version ]]; then
@@ -351,8 +357,19 @@ setup_firewall() {
     iptables -t nat -A PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:$PORT
 
     if [[ -f /etc/debian_version ]]; then
-        if ! dpkg -l | grep -q iptables-persistent; then
-            apt install -y iptables-persistent >/dev/null 2>&1
+        if ! dpkg -l 2>/dev/null | grep -q iptables-persistent; then
+            yellow "正在安装 iptables-persistent（持久化防火墙规则）..."
+            # 预设 debconf 自动保存规则，否则安装中弹交互框+输出被隐藏=看起来卡死
+            echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null
+            echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null
+            if wait_apt_lock; then
+                DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y \
+                    -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 \
+                    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+                    iptables-persistent >/dev/null 2>&1
+            else
+                yellow "跳过 iptables-persistent 安装：规则本次已生效，重启后需重新运行脚本。"
+            fi
         fi
     fi
 
