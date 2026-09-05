@@ -17,13 +17,52 @@ cyan()   { echo -e "${CYAN}$1${PLAIN}"; }
 # 环境准备与依赖
 # ==========================================
 install_deps() {
-    yellow "正在检查并安装必要依赖 (curl, lsof, socat, iptables, iproute2, openssl, cron, gnupg)..."
-    if [[ -f /etc/debian_version ]]; then
-        apt update -y >/dev/null 2>&1
-        apt install -y curl wget lsof socat iptables iproute2 openssl cron systemd gnupg >/dev/null 2>&1
-    elif [[ -f /etc/redhat-release ]]; then
-        yum install -y curl wget lsof socat iptables iproute2 openssl cronie systemd gnupg2 >/dev/null 2>&1
+    # 先检查关键命令，齐了就跳过 apt（最常见的"卡死"就是 apt 在这里无提示等待）
+    local need=(curl openssl iptables ip)
+    local missing=()
+    local cmd
+    for cmd in "${need[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        green "基础依赖已齐全，跳过 apt 安装。"
+        return 0
     fi
+
+    yellow "缺失依赖: ${missing[*]}，正在安装 (curl wget lsof socat iptables iproute2 openssl cron gnupg)..."
+
+    # 等待 apt/dpkg 锁释放（unattended-upgrades 经常占着锁），带提示+上限，不再无声卡死
+    local waited=0
+    while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock >/dev/null 2>&1; do
+        waited=$((waited + 10))
+        if [[ $waited -ge 300 ]]; then
+            red "等待 apt 锁超时（300s），请稍后手动执行 apt install 后再重试。"
+            return 1
+        fi
+        yellow "检测到 apt 被占用（一般是系统自动更新），等待锁释放... (${waited}s/300s)"
+        sleep 10
+    done
+
+    local apt_opts=(-o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2)
+    if [[ -f /etc/debian_version ]]; then
+        DEBIAN_FRONTEND=noninteractive timeout 300 apt-get update "${apt_opts[@]}" >/dev/null 2>&1
+        DEBIAN_FRONTEND=noninteractive timeout 600 apt-get install -y "${apt_opts[@]}" \
+            -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+            curl wget lsof socat iptables iproute2 openssl cron systemd gnupg 2>&1 | tail -n 3
+    elif [[ -f /etc/redhat-release ]]; then
+        timeout 600 yum install -y -q curl wget lsof socat iptables iproute2 openssl cronie systemd gnupg2 2>&1 | tail -n 3
+    fi
+
+    # 复查：还缺就警告但不退出（多数情况下已有命令可用，避免误杀整个安装）
+    missing=()
+    for cmd in "${need[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -ne 0 ]]; then
+        red "警告：以下依赖仍缺失: ${missing[*]}，后续步骤可能失败，可手动安装后重试。"
+        return 1
+    fi
+    green "依赖安装完成。"
 }
 
 get_ip() {
@@ -70,7 +109,7 @@ enable_bbr() {
 install_acme() {
     if [[ ! -f ~/.acme.sh/acme.sh ]]; then
         yellow "正在安装 acme.sh 证书申请工具..."
-        curl https://get.acme.sh | sh >/dev/null 2>&1
+        curl --connect-timeout 15 --max-time 120 -fsSL https://get.acme.sh | sh >/dev/null 2>&1
     fi
     ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1
     ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
@@ -177,7 +216,7 @@ gen_cert_selfsign() {
 # ==========================================
 install_hy2_core() {
     yellow "正在安装 Hysteria2 内核..."
-    bash <(curl -fsSL https://get.hy2.sh) || { red "核心安装失败"; exit 1; }
+    bash <(curl --connect-timeout 15 --max-time 180 -fsSL https://get.hy2.sh) || { red "核心安装失败"; exit 1; }
 }
 
 generate_config() {
@@ -422,7 +461,7 @@ uninstall_hy2() {
         rm -rf /etc/systemd/system/hysteria-server.service.d
         systemctl daemon-reload
 
-        bash <(curl -fsSL https://get.hy2.sh) --remove >/dev/null 2>&1
+        bash <(curl --connect-timeout 15 --max-time 180 -fsSL https://get.hy2.sh) --remove >/dev/null 2>&1
 
         # 删除 hysteria 系统用户（服务已停，无残留进程，此时删除安全）
         if id -u hysteria &>/dev/null; then
