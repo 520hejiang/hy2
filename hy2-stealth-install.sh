@@ -286,7 +286,7 @@ generate_config() {
         # 伪装指向公网 bing（本机无同域名站点可用）
         ADDR="$IP"
         MASQ_URL="https://www.bing.com"
-        LINK="hysteria2://${PASS}@${IP}:${PORT},20000-40000/?obfs=salamander&obfs-password=${OBFS_PASS}&pinSHA256=${CERT_HASH}&sni=bing.com#HY2-${IP}"
+        LINK="hysteria2://${PASS}@${IP}:${PORT}/?obfs=salamander&obfs-password=${OBFS_PASS}&pinSHA256=${CERT_HASH}&sni=bing.com#HY2-${IP}"
         TLS_BLOCK="tls:
   sni: bing.com
   pinSHA256: ${CERT_HASH}"
@@ -295,7 +295,7 @@ generate_config() {
         # 伪装指向本机同域名站点（由 openresty 提供），证书/SNI/内容三者一致
         ADDR="$DOMAIN"
         MASQ_URL="https://${DOMAIN}"
-        LINK="hysteria2://${PASS}@${DOMAIN}:${PORT},20000-40000/?obfs=salamander&obfs-password=${OBFS_PASS}&sni=${DOMAIN}#HY2-${DOMAIN}"
+        LINK="hysteria2://${PASS}@${DOMAIN}:${PORT}/?obfs=salamander&obfs-password=${OBFS_PASS}&sni=${DOMAIN}#HY2-${DOMAIN}"
         TLS_BLOCK="tls:
   sni: ${DOMAIN}"
     fi
