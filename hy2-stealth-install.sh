@@ -78,25 +78,22 @@ udp_port_in_use() {
 }
 
 pick_port() {
-    PORT=443
-    if ! udp_port_in_use "$PORT"; then
-        green "UDP 443 空闲，使用默认端口 443。"
-        return 0
-    fi
-
-    yellow "UDP 443 已被占用，正在随机选择空闲端口..."
+    # 每次安装随机一个四位数端口（1000-9999），不固定 443；
+    # 端口跳跃段是 20000-40000，四位数天然不重叠
+    yellow "正在随机选择监听端口..."
     local try=0
     while true; do
-        # 回退端口避开 20000-40000 端口跳跃段，免得和 DNAT 规则打架
-        PORT=$((40001 + RANDOM % 20000))
-        udp_port_in_use "$PORT" || break
+        PORT=$((1000 + RANDOM % 9000))
+        if ! udp_port_in_use "$PORT"; then
+            break
+        fi
         try=$((try + 1))
         if [[ $try -ge 50 ]]; then
             red "尝试 50 次仍未找到空闲 UDP 端口，请手动释放端口后重试。"
             exit 1
         fi
     done
-    green "已选择空闲端口: $PORT"
+    green "已选择监听端口: $PORT"
 }
 
 # ==========================================
