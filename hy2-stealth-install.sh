@@ -72,6 +72,33 @@ get_ip() {
     [[ -z "$IP" ]] && red "无法获取公网 IPv4，请检查网络" && exit 1
 }
 
+# 只检测 UDP 占用（Hysteria2 只用 UDP；TCP 443 被 openresty 占用是正常的，不能算冲突）
+udp_port_in_use() {
+    ss -uln 2>/dev/null | grep -qE ":$1([[:space:]]|$)"
+}
+
+pick_port() {
+    PORT=443
+    if ! udp_port_in_use "$PORT"; then
+        green "UDP 443 空闲，使用默认端口 443。"
+        return 0
+    fi
+
+    yellow "UDP 443 已被占用，正在随机选择空闲端口..."
+    local try=0
+    while true; do
+        # 回退端口避开 20000-40000 端口跳跃段，免得和 DNAT 规则打架
+        PORT=$((40001 + RANDOM % 20000))
+        udp_port_in_use "$PORT" || break
+        try=$((try + 1))
+        if [[ $try -ge 50 ]]; then
+            red "尝试 50 次仍未找到空闲 UDP 端口，请手动释放端口后重试。"
+            exit 1
+        fi
+    done
+    green "已选择空闲端口: $PORT"
+}
+
 # ==========================================
 # 系统内核优化 (BBR)
 # ==========================================
@@ -229,7 +256,7 @@ generate_config() {
         # 伪装指向公网 bing（本机无同域名站点可用）
         ADDR="$IP"
         MASQ_URL="https://www.bing.com"
-        LINK="hysteria2://${PASS}@${IP}:443/?obfs=salamander&obfs-password=${OBFS_PASS}&mport=20000-40000&pinSHA256=${CERT_HASH}&sni=bing.com#HY2-${IP}"
+        LINK="hysteria2://${PASS}@${IP}:$PORT/?obfs=salamander&obfs-password=${OBFS_PASS}&mport=20000-40000&pinSHA256=${CERT_HASH}&sni=bing.com#HY2-${IP}"
         TLS_BLOCK="tls:
   sni: bing.com
   pinSHA256: ${CERT_HASH}"
@@ -238,13 +265,13 @@ generate_config() {
         # 伪装指向本机同域名站点（由 openresty 提供），证书/SNI/内容三者一致
         ADDR="$DOMAIN"
         MASQ_URL="https://${DOMAIN}"
-        LINK="hysteria2://${PASS}@${DOMAIN}:443/?obfs=salamander&obfs-password=${OBFS_PASS}&mport=20000-40000&sni=${DOMAIN}#HY2-${DOMAIN}"
+        LINK="hysteria2://${PASS}@${DOMAIN}:$PORT/?obfs=salamander&obfs-password=${OBFS_PASS}&mport=20000-40000&sni=${DOMAIN}#HY2-${DOMAIN}"
         TLS_BLOCK="tls:
   sni: ${DOMAIN}"
     fi
 
     cat > /etc/hysteria/config.yaml <<EOF
-listen: :443
+listen: :$PORT
 
 tls:
   cert: /etc/hysteria/server.crt
@@ -291,7 +318,7 @@ EOF
     echo "$LINK" > /root/hy2/link.txt
 
     cat > /root/hy2/client.yaml <<EOF
-server: ${ADDR}:443
+server: ${ADDR}:$PORT
 auth: ${PASS}
 mport: 20000-40000
 
@@ -311,20 +338,20 @@ EOF
 }
 
 setup_firewall() {
-    yellow "正在配置防火墙及端口跳跃 NAT 转发（IPv4）..."
+    yellow "正在配置防火墙及端口跳跃 NAT 转发（IPv4，监听端口 $PORT）..."
 
     LOCAL_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP '(?<=src )\d+\.\d+\.\d+\.\d+' | head -1)
     [[ -z "$LOCAL_IP" ]] && LOCAL_IP=$(hostname -I | awk '{print $1}')
 
-    iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j REDIRECT --to-ports 443 2>/dev/null
-    iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:443 2>/dev/null
+    iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j REDIRECT --to-ports $PORT 2>/dev/null
+    iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:$PORT 2>/dev/null
 
-    iptables -D INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null
+    iptables -D INPUT -p udp --dport $PORT -j ACCEPT 2>/dev/null
     iptables -D INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null
-    iptables -I INPUT -p udp --dport 443 -j ACCEPT
+    iptables -I INPUT -p udp --dport $PORT -j ACCEPT
     iptables -I INPUT -p tcp --dport 443 -j ACCEPT
 
-    iptables -t nat -A PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:443
+    iptables -t nat -A PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:$PORT
 
     if [[ -f /etc/debian_version ]]; then
         if ! dpkg -l | grep -q iptables-persistent; then
@@ -408,7 +435,9 @@ show_info() {
         cyan "/root/hy2/client.yaml"
         echo ""
         yellow "防封锁特性状态："
-        green "✓ 已启用 端口跳跃 (Port Hopping: 20000-40000 转发至 443, IPv4)"
+        PORT_SHOW=$(grep -oP '(?<=:)[0-9]+(?=/\?)' /root/hy2/link.txt 2>/dev/null | head -1)
+        [[ -z "$PORT_SHOW" ]] && PORT_SHOW="443"
+        green "✓ 已启用 端口跳跃 (Port Hopping: 20000-40000 转发至 ${PORT_SHOW}, IPv4)"
         if [[ -f /root/hy2/mode.txt && "$(cat /root/hy2/mode.txt)" == "selfsign" ]]; then
             green "✓ 自签证书 (有效期 100 年，无需续期，客户端已用 pinSHA256 锁定)"
         else
@@ -431,11 +460,15 @@ uninstall_hy2() {
         systemctl stop hysteria-server 2>/dev/null
         systemctl disable hysteria-server 2>/dev/null
 
+        # 本次安装使用的端口（老版本无此信息则按 443 清理）
+        UPORT=$(grep -oP '(?<=:)[0-9]+(?=/\?)' /root/hy2/link.txt 2>/dev/null | head -1)
+        [[ -z "$UPORT" ]] && UPORT=443
+
         LOCAL_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP '(?<=src )\d+\.\d+\.\d+\.\d+' | head -1)
         [[ -z "$LOCAL_IP" ]] && LOCAL_IP=$(hostname -I | awk '{print $1}')
-        iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j REDIRECT --to-ports 443 2>/dev/null
-        iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:443 2>/dev/null
-        iptables -D INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null
+        iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j REDIRECT --to-ports $UPORT 2>/dev/null
+        iptables -t nat -D PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:$UPORT 2>/dev/null
+        iptables -D INPUT -p udp --dport $UPORT -j ACCEPT 2>/dev/null
         iptables -D INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null
         iptables -D INPUT -p udp -m multiport --dports 20000:40000 -j ACCEPT 2>/dev/null
 
@@ -475,6 +508,7 @@ uninstall_hy2() {
 
 install_menu() {
     get_ip
+    pick_port
     install_deps
     enable_bbr
 
