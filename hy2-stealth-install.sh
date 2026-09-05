@@ -51,12 +51,13 @@ install_deps() {    # 先检查关键命令，齐了就跳过 apt（最常见的
 
     local apt_opts=(-o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2)
     if [[ -f /etc/debian_version ]]; then
-        DEBIAN_FRONTEND=noninteractive timeout 300 apt-get update "${apt_opts[@]}" >/dev/null 2>&1
+        # stdin 必须关闭，否则 apt/dpkg 侧任何提示都会无限等待
+        DEBIAN_FRONTEND=noninteractive timeout 300 apt-get update "${apt_opts[@]}" </dev/null >/dev/null 2>&1
         DEBIAN_FRONTEND=noninteractive timeout 600 apt-get install -y "${apt_opts[@]}" \
             -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
-            curl wget lsof socat iptables iproute2 openssl cron systemd gnupg 2>&1 | tail -n 3
+            curl wget lsof socat iptables iproute2 openssl cron systemd gnupg </dev/null 2>&1 | tail -n 3
     elif [[ -f /etc/redhat-release ]]; then
-        timeout 600 yum install -y -q curl wget lsof socat iptables iproute2 openssl cronie systemd gnupg2 2>&1 | tail -n 3
+        timeout 600 yum install -y -q curl wget lsof socat iptables iproute2 openssl cronie systemd gnupg2 </dev/null 2>&1 | tail -n 3
     fi
 
     # 复查：还缺就警告但不退出（多数情况下已有命令可用，避免误杀整个安装）
@@ -139,10 +140,23 @@ enable_bbr() {
 install_acme() {
     if [[ ! -f ~/.acme.sh/acme.sh ]]; then
         yellow "正在安装 acme.sh 证书申请工具..."
-        curl --connect-timeout 15 --max-time 120 -fsSL https://get.acme.sh | sh >/dev/null 2>&1
+        # 先下载到文件并验非空：curl 失败时空管道会让 sh 直接"成功"，造成后面莫名失败
+        local installer=/tmp/get.acme.sh
+        rm -f "$installer"
+        if ! curl --connect-timeout 15 --max-time 120 -fsSL https://get.acme.sh -o "$installer" 2>/dev/null || [[ ! -s "$installer" ]]; then
+            red "acme.sh 下载失败，请检查网络（github/外网是否可达）后重试。"
+            rm -f "$installer"
+            exit 1
+        fi
+        bash "$installer" </dev/null >/dev/null 2>&1
+        rm -f "$installer"
+        if [[ ! -f ~/.acme.sh/acme.sh ]]; then
+            red "acme.sh 安装失败，请检查网络后重试。"
+            exit 1
+        fi
     fi
-    ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1
-    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
+    timeout 120 ~/.acme.sh/acme.sh --upgrade --auto-upgrade </dev/null >/dev/null 2>&1
+    timeout 60 ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt </dev/null >/dev/null 2>&1
 }
 
 apply_cert_dns() {
@@ -160,7 +174,7 @@ apply_cert_dns() {
 
     yellow "正在使用 DNS API 模式申请证书 (通过 API 验证，无需 80 端口)..."
     yellow "这通常需要 1-2 分钟，请耐心等待..."
-    ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" -k ec-256 --force
+    ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" -k ec-256 --force </dev/null
 
     if [ $? -ne 0 ]; then
         red "证书申请失败！请检查 API Token 和 账户 ID 是否正确。"
@@ -246,7 +260,20 @@ gen_cert_selfsign() {
 # ==========================================
 install_hy2_core() {
     yellow "正在安装 Hysteria2 内核..."
-    bash <(curl --connect-timeout 15 --max-time 180 -fsSL https://get.hy2.sh) || { red "核心安装失败"; exit 1; }
+    # 先下载验非空再执行：空管道 bash 会"成功"，导致后面服务起不来还查不出原因
+    local installer=/tmp/get.hy2.sh
+    rm -f "$installer"
+    if ! curl --connect-timeout 15 --max-time 180 -fsSL https://get.hy2.sh -o "$installer" 2>/dev/null || [[ ! -s "$installer" ]]; then
+        red "Hysteria2 安装脚本下载失败，请检查网络（GitHub 是否可达）后重试。"
+        rm -f "$installer"
+        exit 1
+    fi
+    bash "$installer" </dev/null || { red "核心安装失败"; rm -f "$installer"; exit 1; }
+    rm -f "$installer"
+    if [[ ! -x /usr/local/bin/hysteria && ! -x /usr/bin/hysteria ]]; then
+        red "Hysteria2 二进制未找到，核心安装失败，请检查网络后重试。"
+        exit 1
+    fi
 }
 
 generate_config() {
@@ -340,6 +367,64 @@ http:
 EOF
 }
 
+# 防火墙持久化（三级兜底，apt 包装不上也不卡安装流程）
+persist_firewall() {
+    # 1) 已有 netfilter-persistent：直接保存
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        mkdir -p /etc/iptables
+        netfilter-persistent save </dev/null >/dev/null 2>&1
+        green "防火墙规则已持久化（netfilter-persistent）。"
+        return 0
+    fi
+
+    # 2) 尝试安装 iptables-persistent（best-effort，180s 超时+失败就走兜底，绝不等死）
+    if [[ -f /etc/debian_version ]] && ! dpkg -l 2>/dev/null | grep -q '^ii.*iptables-persistent'; then
+        yellow "正在安装 iptables-persistent（持久化防火墙规则）..."
+        echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null
+        echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null
+        if wait_apt_lock; then
+            DEBIAN_FRONTEND=noninteractive timeout 180 apt-get install -y \
+                -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 \
+                -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+                iptables-persistent </dev/null >/dev/null 2>&1 \
+            && command -v netfilter-persistent >/dev/null 2>&1 \
+            && { mkdir -p /etc/iptables; netfilter-persistent save </dev/null >/dev/null 2>&1; green "防火墙规则已持久化（netfilter-persistent）。"; return 0; }
+        fi
+        yellow "iptables-persistent 不可用，改用自带开机恢复单元持久化。"
+    fi
+
+    # 3) 兜底：iptables-save + 自带 systemd 开机恢复单元（不依赖任何 apt 包）
+    if command -v iptables-save >/dev/null 2>&1; then
+        local ipt_restore
+        ipt_restore=$(command -v iptables-restore 2>/dev/null || echo /sbin/iptables-restore)
+        mkdir -p /etc/iptables
+        if iptables-save > /etc/iptables/rules.v4 2>/dev/null && [[ -s /etc/iptables/rules.v4 ]]; then
+            cat > /etc/systemd/system/hy2-iptables-restore.service <<EOF
+[Unit]
+Description=Restore Hysteria2 iptables rules
+Before=network-pre.target hysteria-server.service
+Wants=network-pre.target
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=${ipt_restore} /etc/iptables/rules.v4
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload 2>/dev/null
+            systemctl enable hy2-iptables-restore.service </dev/null >/dev/null 2>&1
+            green "防火墙规则已持久化（自带开机恢复单元）。"
+            return 0
+        fi
+    fi
+
+    yellow "警告：防火墙持久化失败，规则本次已生效，重启后需重新运行脚本。"
+    return 1
+}
+
 setup_firewall() {
     yellow "正在配置防火墙及端口跳跃 NAT 转发（IPv4，监听端口 $PORT）..."
 
@@ -356,35 +441,9 @@ setup_firewall() {
 
     iptables -t nat -A PREROUTING -p udp --dport 20000:40000 -j DNAT --to-destination ${LOCAL_IP}:$PORT
 
-    if [[ -f /etc/debian_version ]]; then
-        if ! dpkg -l 2>/dev/null | grep -q iptables-persistent; then
-            yellow "正在安装 iptables-persistent（持久化防火墙规则）..."
-            # 预设 debconf 自动保存规则，否则安装中弹交互框+输出被隐藏=看起来卡死
-            echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null
-            echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null
-            if wait_apt_lock; then
-                DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y \
-                    -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 \
-                    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
-                    iptables-persistent >/dev/null 2>&1
-            else
-                yellow "跳过 iptables-persistent 安装：规则本次已生效，重启后需重新运行脚本。"
-            fi
-        fi
-    fi
+    persist_firewall
 
-    if command -v netfilter-persistent >/dev/null; then
-        mkdir -p /etc/iptables
-        netfilter-persistent save >/dev/null 2>&1
-    elif command -v iptables-save >/dev/null; then
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null
-        if [ ! -f /etc/iptables/rules.v4 ]; then
-            iptables-save > /etc/sysconfig/iptables 2>/dev/null
-        fi
-    fi
-
-    green "防火墙规则已配置并持久化（DNAT 模式）。"
+    green "防火墙规则已配置（DNAT 模式）。"
 }
 
 setup_systemd() {
@@ -423,8 +482,8 @@ EOF
 
 start_service() {
     systemctl daemon-reload
-    systemctl enable hysteria-server >/dev/null 2>&1
-    systemctl restart hysteria-server
+    systemctl enable hysteria-server </dev/null >/dev/null 2>&1
+    timeout 90 systemctl restart hysteria-server </dev/null >/dev/null 2>&1
     sleep 2
     if systemctl is-active --quiet hysteria-server; then
         green "Hysteria2 启动成功！"
@@ -506,9 +565,17 @@ uninstall_hy2() {
         rm -rf /root/hy2
         rm -f /etc/systemd/system/hysteria-server.service
         rm -rf /etc/systemd/system/hysteria-server.service.d
+        rm -f /etc/systemd/system/hy2-iptables-restore.service
         systemctl daemon-reload
 
-        bash <(curl --connect-timeout 15 --max-time 180 -fsSL https://get.hy2.sh) --remove >/dev/null 2>&1
+        # 下载验非空再执行，空管道 bash 会"成功"造成残留
+        HY2_REMOVER=/tmp/get.hy2.sh
+        rm -f "$HY2_REMOVER"
+        if curl --connect-timeout 15 --max-time 120 -fsSL https://get.hy2.sh -o "$HY2_REMOVER" 2>/dev/null && [[ -s "$HY2_REMOVER" ]]; then
+            bash "$HY2_REMOVER" --remove </dev/null >/dev/null 2>&1
+        fi
+        rm -f "$HY2_REMOVER"
+        rm -f /usr/local/bin/hysteria /usr/bin/hysteria
 
         # 删除 hysteria 系统用户（服务已停，无残留进程，此时删除安全）
         if id -u hysteria &>/dev/null; then
@@ -580,8 +647,8 @@ main() {
         case $menu_choice in
             1) install_menu ;;
             2) show_info ;;
-            3) systemctl restart hysteria-server && green "重启成功" && sleep 2 ;;
-            4) systemctl stop hysteria-server && yellow "已停止" && sleep 2 ;;
+            3) timeout 90 systemctl restart hysteria-server </dev/null && green "重启成功" && sleep 2 ;;
+            4) timeout 60 systemctl stop hysteria-server </dev/null && yellow "已停止" && sleep 2 ;;
             5) uninstall_hy2 ;;
             0) exit 0 ;;
             *) red "请输入正确的数字!" && sleep 2 ;;
